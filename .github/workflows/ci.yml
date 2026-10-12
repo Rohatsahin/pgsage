@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: 🧪 Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    env:
+      PYTHON_VERSION: ${{ matrix.python }}
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up uv and Python ${{ matrix.python }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: 📦 Install dependencies
+        id: install
+        run: uv sync --all-extras --locked
+
+      - name: 🐘 Pull Postgres image
+        id: pull
+        continue-on-error: true
+        run: docker pull postgres:17
+
+      - name: 🧹 Lint (ruff check)
+        id: lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: uv run ruff check --output-format=github .
+
+      - name: 🎨 Format (ruff format)
+        id: format
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: uv run ruff format --check --diff .
+
+      - name: 🔎 Types (pyright strict)
+        id: types
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: uv run pyright
+
+      - name: 🧪 Tests (pytest)
+        id: tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: uv run pytest -p no:cacheprovider --junitxml=reports/junit.xml --durations=5
+
+      - name: 📊 Job summary
+        if: ${{ always() }}
+        env:
+          STEP_INSTALL: ${{ steps.install.outcome }}
+          STEP_PULL: ${{ steps.pull.outcome }}
+          STEP_LINT: ${{ steps.lint.outcome }}
+          STEP_FORMAT: ${{ steps.format.outcome }}
+          STEP_TYPES: ${{ steps.types.outcome }}
+          STEP_TESTS: ${{ steps.tests.outcome }}
+        run: python3 scripts/ci_summary.py reports/junit.xml || true
+
+      - name: 📎 Upload test report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-python-${{ matrix.python }}
+          path: reports/junit.xml
+          if-no-files-found: ignore
+
+      - name: 🚦 Gate
+        if: ${{ always() }}
+        env:
+          STEP_INSTALL: ${{ steps.install.outcome }}
+          STEP_LINT: ${{ steps.lint.outcome }}
+          STEP_FORMAT: ${{ steps.format.outcome }}
+          STEP_TYPES: ${{ steps.types.outcome }}
+          STEP_TESTS: ${{ steps.tests.outcome }}
+        run: |
+          for step in INSTALL LINT FORMAT TYPES TESTS; do
+            outcome="STEP_${step}"
+            if [ "${!outcome}" != "success" ]; then
+              echo "❌ ${step,,}: ${!outcome}"
+              failed=1
+            else
+              echo "✅ ${step,,}"
+            fi
+          done
+          exit "${failed:-0}"
