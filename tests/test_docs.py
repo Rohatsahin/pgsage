@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).parent.parent
+
+
 MARKDOWN = [
     ROOT / "README.md",
     ROOT / "AGENTS.md",
@@ -12,7 +14,11 @@ MARKDOWN = [
     ROOT / "SECURITY.md",
     *sorted((ROOT / "docs").glob("*.md")),
 ]
+
+
 LINK = re.compile(r"\]\(([^)#\s]+)(?:#[^)]*)?\)")
+
+
 SRC_REFERENCE = re.compile(r"`((?:src|tests|scripts|docs)/[\w./-]+)`")
 
 
@@ -36,6 +42,12 @@ def test_referenced_repository_paths_exist(path: Path) -> None:
         assert (ROOT / reference).exists(), f"{path.name} mentions missing {reference}"
 
 
+@pytest.mark.parametrize("path", MARKDOWN, ids=lambda p: p.name)
+def test_every_test_file_a_doc_mentions_exists(path: Path) -> None:
+    for name in set(re.findall(r"\b(test_[a-z_]+\.py)\b", path.read_text())):
+        assert (ROOT / "tests" / name).exists(), f"{path.name} mentions missing tests/{name}"
+
+
 def test_readme_shows_the_logo_and_it_exists() -> None:
     assert "assets/logo.svg" in (ROOT / "README.md").read_text()
     svg = (ROOT / "assets" / "logo.svg").read_text()
@@ -49,7 +61,7 @@ def test_readme_command_table_matches_the_real_cli() -> None:
 
     help_text = CliRunner().invoke(app, ["--help"]).output
     readme = (ROOT / "README.md").read_text()
-    for command in ("explain", "tune", "verify", "top", "diff", "eval"):
+    for command in ("explain", "tune", "verify", "top", "eval"):
         assert command in help_text
         assert f"`pgsage {command}" in readme
 

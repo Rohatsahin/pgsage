@@ -19,6 +19,7 @@ def load() -> ModuleType:
 
 ci = load()
 
+
 JUNIT = """<?xml version="1.0" encoding="utf-8"?>
 <testsuites><testsuite name="pytest" tests="5">
 <testcase classname="tests.test_alpha" name="test_fast" time="0.010"/>
@@ -31,10 +32,12 @@ assert 1 == 2</failure></testcase>
 </testsuite></testsuites>
 """
 
+
 PASSING = (
     '<testsuites><testsuite><testcase classname="tests.test_a" name="t" time="0.1"/>'
     "</testsuite></testsuites>"
 )
+
 
 GREEN = {
     "install": "success",

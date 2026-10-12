@@ -6,6 +6,7 @@ from typing import LiteralString, cast
 
 import psycopg
 import pytest
+from psycopg.conninfo import make_conninfo
 from psycopg.sql import SQL
 from testcontainers.community.postgres import PostgresContainer
 
@@ -19,19 +20,20 @@ def _docker_available() -> bool:
         return False
 
 
+DOCKER_FIXTURES = {"pg_dsn", "pg_conn", "stats_dsn"}
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     needs_docker = [
-        item
-        for item in items
-        if "pg_dsn" in getattr(item, "fixturenames", ()) or item.get_closest_marker("docker")
+        item for item in items if DOCKER_FIXTURES & set(getattr(item, "fixturenames", ()))
     ]
+    for item in needs_docker:
+        item.add_marker(pytest.mark.docker)
     if not needs_docker or _docker_available():
         return
-    skip = pytest.mark.skip(
-        reason="Docker is not available; run with a Docker daemon or -m 'not docker'"
-    )
+    reason = "Docker is not available; run with a Docker daemon or -m 'not docker'"
     for item in needs_docker:
-        item.add_marker(skip)
+        item.add_marker(pytest.mark.skip(reason=reason))
 
 
 @pytest.fixture(scope="session")
@@ -62,3 +64,34 @@ def explain_json(conn: psycopg.Connection, sql: str, analyze: bool = True) -> st
     row = conn.execute(statement).fetchone()
     assert row is not None
     return json.dumps(row[0])
+
+
+@pytest.fixture
+def victim(pg_conn: psycopg.Connection) -> Iterator[None]:
+    pg_conn.execute("DROP TABLE IF EXISTS victim")
+    pg_conn.execute("CREATE TABLE victim AS SELECT 1 AS id")
+    yield
+    pg_conn.execute("DROP TABLE IF EXISTS victim")
+
+
+@pytest.fixture(scope="session")
+def stats_dsn() -> Iterator[str]:
+    container = PostgresContainer("postgres:17", driver=None).with_command(
+        "postgres -c shared_preload_libraries=pg_stat_statements"
+    )
+    with container as pg:
+        dsn = pg.get_connection_url()
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute("CREATE EXTENSION pg_stat_statements")
+            conn.execute("CREATE TABLE t AS SELECT g AS id FROM generate_series(1, 50000) g")
+            for value in (1, 2, 3):
+                conn.execute("SELECT count(*) FROM t WHERE id > %s", (value,))
+            conn.execute("UPDATE t SET id = id WHERE id = 1")
+            conn.execute("CREATE DATABASE otherdb")
+        with psycopg.connect(make_conninfo(dsn, dbname="otherdb"), autocommit=True) as other:
+            other.execute("CREATE EXTENSION pg_stat_statements")
+            other.execute(
+                "SELECT count(*) FROM generate_series(1, 300000) WHERE 1 = 1 OFFSET 0 -- marker_other_db"
+            )
+            other.execute("SELECT 424242 AS marker_other_db_value")
+        yield dsn

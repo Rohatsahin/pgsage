@@ -1,12 +1,118 @@
+import random
+from collections.abc import Iterator
+
+import psycopg
 import pytest
 
+from pgsage import verify as verify_module
+from pgsage.context import get_plan
 from pgsage.sqlscan import is_ambiguous, mask, redact_condition
-from pgsage.verify import UnsafeStatementError, ensure_read_only, ensure_safe_predicate
+from pgsage.verify import (
+    UnsafeStatementError,
+    ensure_read_only,
+    ensure_safe_predicate,
+    literal,
+    run_explain,
+    run_single,
+    verify_rewrite,
+)
+
+TOKENS = [
+    "SELECT 1",
+    "SELECT",
+    ";",
+    "'",
+    "''",
+    '"',
+    "--",
+    "/*",
+    "*/",
+    "$$",
+    "$a$",
+    "$1$",
+    "\r",
+    "\n",
+    " ",
+    "x",
+    "e'",
+    "E'",
+    "\\",
+    "(",
+    ")",
+    "DROP TABLE t",
+    "1",
+    "U&'",
+    'U&"',
+]
+
+
+SAMPLES = 4000
+
+
+def samples(seed: int) -> Iterator[str]:
+    rng = random.Random(seed)
+    for _ in range(SAMPLES):
+        yield "SELECT 1 " + "".join(rng.choice(TOKENS) for _ in range(rng.randint(1, 10)))
+
+
+def exists(conn: psycopg.Connection, name: str) -> bool:
+    row = conn.execute("SELECT to_regclass(%s) IS NOT NULL", (name,)).fetchone()
+    return row == (True,)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_nothing_the_gate_accepts_is_ever_more_than_one_statement_to_postgres(
+    pg_dsn: str, seed: int
+) -> None:
+    accepted = 0
+    with psycopg.connect(pg_dsn) as conn:
+        conn.read_only = True
+        for sql in samples(seed):
+            try:
+                ensure_read_only(sql)
+            except UnsafeStatementError:
+                continue
+            accepted += 1
+            try:
+                run_single(conn, literal(sql))
+            except psycopg.Error as error:
+                assert "multiple commands" not in str(error), f"lexer disagreement on {sql!r}"
+            finally:
+                conn.rollback()
+    assert accepted > 50
+
+
+def test_the_database_refuses_a_second_statement_whatever_the_gate_says(
+    pg_dsn: str, pg_conn: psycopg.Connection, victim: None
+) -> None:
+    with psycopg.connect(pg_dsn) as conn:
+        with pytest.raises(psycopg.Error, match="multiple commands"):
+            run_explain(conn, "SELECT 1; SELECT 2")
+        conn.rollback()
+        with pytest.raises(psycopg.Error, match="multiple commands"):
+            run_single(conn, literal("CREATE INDEX ON orders (id); DROP TABLE victim"))
+    assert exists(pg_conn, "victim")
+
+
+def test_even_with_the_sql_gate_disabled_a_smuggled_statement_cannot_run(
+    pg_dsn: str, pg_conn: psycopg.Connection, victim: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def allow_everything(sql: str) -> None:
+        return None
+
+    monkeypatch.setattr(verify_module, "ensure_read_only", allow_everything)
+    with pytest.raises(psycopg.Error):
+        get_plan(pg_dsn, "SELECT 1 /* x */; DROP TABLE victim")
+    with pytest.raises(psycopg.Error):
+        verify_rewrite(pg_dsn, "SELECT 1 AS a", "SELECT 1 AS a /* x */; DROP TABLE victim")
+    assert exists(pg_conn, "victim")
 
 
 @pytest.mark.parametrize(
     "sql",
     [
+        "DELETE FROM t",
+        "UPDATE t SET id = 1",
         "SELECT 1; COMMIT; GRANT ALL ON victim TO PUBLIC",
         "SELECT 1; COMMIT; DO $$ BEGIN EXECUTE 'cr'||'eate table pwned()'; END $$",
         "SELECT 1; SELECT 2",
@@ -83,6 +189,7 @@ def test_mask_hides_literals_and_comments_but_not_structure() -> None:
         ("(a > 1e5) AND (b < 1.5e-3)", "(a > ?) AND (b < ?)"),
         ("(a = 5) -- it's secret", "(a = ?)  "),
         ("(col1 = 2)", "(col1 = ?)"),
+        ("(name = 'O''Brien') AND (x > -1.5)", "(name = ?) AND (x > ?)"),
     ],
 )
 def test_redact_condition(text: str, expected: str) -> None:

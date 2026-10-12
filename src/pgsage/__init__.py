@@ -11,7 +11,6 @@ except PackageNotFoundError:
     __version__ = "0+unknown"
 
 __all__ = [
-    "__version__",
     "Action",
     "ExplainResult",
     "Explanation",
@@ -19,6 +18,7 @@ __all__ = [
     "PlanNode",
     "TuneReport",
     "VerifyResult",
+    "__version__",
     "explain_plan",
     "parse_explain",
     "plan_digest",

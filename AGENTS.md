@@ -15,6 +15,7 @@ Always go through `uv`. Docker must be running (the tests start `postgres:17` wi
 make check                      # lint + format + pyright + pytest, with an emoji summary
 uv run pytest -q                # all tests (~15s)
 uv run pytest tests/test_sql_gate.py -q     # one file
+uv run pytest -m "not docker" -q            # everything that needs no Docker
 uv run ruff check . && uv run ruff format .
 uv run pyright                  # strict; covers src, tests, scripts
 uv run pgsage eval --dsn <scratch-db> --oracle   # validate the eval harness without an LLM
@@ -39,6 +40,32 @@ uv run pgsage eval --dsn <scratch-db> --oracle   # validate the eval harness wit
 | `src/pgsage/evals.py` | eval cases and the harness |
 | `src/pgsage/cli.py`, `mcp_server.py`, `mcp_main.py` | the two front ends; `mcp_main` is the `pgsage-mcp` launcher that explains a missing `mcp` extra |
 | `scripts/` | CI summary generator and `check.sh` |
+
+## Where tests go
+
+Tests are organised by topic, one file per area. Add to the matching file; do not create a new
+file per change or per review round.
+
+| File | Covers |
+| --- | --- |
+| `test_sql_gate.py` | the lexer, `ensure_read_only`, fail-closed ambiguity, single-statement execution, the differential fuzz against PostgreSQL |
+| `test_verify.py` | the proof (`improved`, `measure`), suggestions and their DDL, equivalence, partitions, read-only phases, timeouts |
+| `test_tune.py` | the propose, validate, prove, retry loop; allow-list; schema resolution; hostile names end to end |
+| `test_context.py` | `get_plan`, `table_info`, ancestors, `top_queries` |
+| `test_plan.py` | the `EXPLAIN` model, derived timings, parallel plans |
+| `test_prompt.py` | the system prompt file and schema, prompt building, size limits, injection, caching layout |
+| `test_redaction.py` | literal tokens, name aliasing, plan sanitization |
+| `test_llm.py` | Anthropic and OpenAI-compatible clients, parsing the model's reply |
+| `test_report.py` | the Markdown, JSON and SQL outputs |
+| `test_cli.py` | the CLI commands and query input (`--file`, stdin, editor, `--dry-run`) |
+| `test_mcp.py` | the MCP tools and launcher |
+| `test_evals.py` | the eval harness |
+| `test_docs.py`, `test_ci_summary.py` | docs stay true to the code; the CI job-summary script |
+
+Tests that need Docker are marked and skipped automatically when it is missing
+(`conftest.pytest_collection_modifyitems`); `pytest -m "not docker"` runs the rest. Shared
+fixtures (`pg_dsn`, `pg_conn`, `victim`, `stats_dsn`) live in `conftest.py`; the fake LLM is in
+`fakes.py`.
 
 ## Hard invariants (never weaken these)
 
@@ -94,7 +121,7 @@ These exist because an external review found real exploits. Each has regression 
 
 **Change the prompt.** Edit `src/pgsage/prompts/system.md`. It is the single source of truth and
 is loaded verbatim. Its three examples are validated against `EXPLANATION_SCHEMA` and the models
-by `tests/test_prompt_file.py`; keep them valid. Do not put dates, ids or any per-request text in
+by `tests/test_prompt.py`; keep them valid. Do not put dates, ids or any per-request text in
 it, or the prompt cache breaks (`test_prompt_is_static_so_the_cache_prefix_never_changes`).
 
 **Add a field to the model output.** Four places move together: `src/pgsage/schema.py` (all keys
@@ -111,7 +138,7 @@ bad names, injection, rollback, read-only phases.
 Add it to `cli.make_client`. Test with a fake transport, as `OpenAICompatibleClient` does.
 
 **Add an eval case.** Append to `evals.CASES` with a setup, a query, an expectation and an
-oracle reply. `tests/test_evals_postgres.py` proves every oracle passes; check the case does not
+oracle reply. `tests/test_evals.py` proves every oracle passes; check the case does not
 depend on timing noise (look for at least a 2x effect).
 
 ## Prompt size
@@ -120,7 +147,7 @@ depend on timing noise (look for at least a 2x effect).
 `MAX_PLAN_NODES`, a capped digest, and a `MAX_QUERY_CHARS` refusal instead of truncation. Never
 reintroduce `indent=` or silent truncation of the query: both were real bugs (indentation grows
 with plan depth; a truncated query makes the model reason about SQL it was not given). Tests in
-`tests/test_prompt_efficiency.py` pin this. `pgsage tune --dry-run` is the quick way to inspect.
+`tests/test_prompt.py` pin this. `pgsage tune --dry-run` is the quick way to inspect.
 
 ## Gotchas
 

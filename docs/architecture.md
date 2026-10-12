@@ -73,7 +73,6 @@ Data crosses the boundary twice and is treated as hostile both times. See `docs/
 | `tune.py` | Rounds, allow-list, attempt feedback; one `VerifiedChange` per proposal |
 | `report.py` | Tool-neutral output for a `TuneReport`: a Markdown report for people, a versioned JSON report for tools, and a plain, idempotent SQL script of the proven DDL. Files are timestamped and never overwrite an earlier run |
 | `evals.py` | Cases with known fixes, isolated per-case schemas, an oracle client |
-| `shape.py` | Plan-shape fingerprint and diff, for regression checks |
 | `cli.py`, `mcp_server.py` | Front ends; no logic of their own beyond wiring and printing |
 
 ## Prompt layout and caching

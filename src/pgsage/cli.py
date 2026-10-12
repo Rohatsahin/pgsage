@@ -26,7 +26,6 @@ from pgsage.context import top_queries
 from pgsage.evals import CASES, OracleClient, run_evals
 from pgsage.plan import parse_explain
 from pgsage.report import write_report
-from pgsage.shape import diff_shapes
 from pgsage.tune import DEFAULT_ROUNDS, TuneReport, prepare_prompt, tune
 from pgsage.verify import IndexSuggestion, VerifyResult, verify_index
 
@@ -228,7 +227,10 @@ def _echo_report(report: TuneReport) -> None:
         typer.echo(f"\n({report.rounds} rounds)")
 
 
-@app.command(name="explain", help="Explain an EXPLAIN (ANALYZE, FORMAT JSON) plan with an LLM.")
+@app.command(
+    name="explain",
+    help="Explain a plan you already have with an LLM (unverified; tune proves changes).",
+)
 def explain_command(
     file: Annotated[Path | None, typer.Argument(help="EXPLAIN JSON file; stdin if omitted")] = None,
     model: Model = None,
@@ -238,11 +240,21 @@ def explain_command(
 ) -> None:
     try:
         raw = file.read_text() if file else sys.stdin.read()
+        plan = parse_explain(raw)
         client = make_client(model, provider.value, base_url, effort.value)
-        explanation = explain_plan(client, parse_explain(raw))
+        if not plan.analyzed:
+            typer.echo(
+                "warning: this plan has no ANALYZE timings, so the analysis will be shallow; "
+                "use EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)",
+                err=True,
+            )
+        explanation = explain_plan(client, plan)
     except (ValueError, ExplanationError, OSError) as error:
         raise _fail(error) from error
     _echo_explanation(explanation)
+    typer.echo(
+        "\nUnverified: nothing above was measured. `pgsage tune` proves changes on a database."
+    )
     _echo_usage(client)
 
 
@@ -355,26 +367,6 @@ def top_command(
         typer.echo(f"{row['total_ms']} ms total, {row['calls']} calls, {row['mean_ms']} ms avg")
         typer.echo(f"    {query}")
     typer.echo("\nQueries show $n placeholders: substitute real values, then run `pgsage tune`.")
-
-
-@app.command(name="diff", help="Exit 1 if the plan shape differs between two EXPLAIN JSON files.")
-def diff_command(
-    before: Annotated[Path, typer.Argument(help="Baseline EXPLAIN JSON")],
-    after: Annotated[Path, typer.Argument(help="New EXPLAIN JSON")],
-) -> None:
-    try:
-        result = diff_shapes(parse_explain(before.read_text()), parse_explain(after.read_text()))
-    except (ValueError, OSError) as error:
-        raise _fail(error) from error
-    if not result.changed:
-        typer.echo("Plan shape unchanged")
-        return
-    typer.echo("Plan shape changed")
-    typer.echo("before: " + " > ".join(n.node for n in result.before))
-    typer.echo("after:  " + " > ".join(n.node for n in result.after))
-    if result.slowdown is not None:
-        typer.echo(f"execution time x{result.slowdown:.2f}")
-    raise typer.Exit(1)
 
 
 @app.command(name="eval", help="Score a model on cases with known fixes.")

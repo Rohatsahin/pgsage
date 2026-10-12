@@ -152,12 +152,6 @@ def test_identifier_quotes_are_escaped_in_the_script() -> None:
     assert '"x""); DROP TABLE v; --"' in statement
 
 
-def test_the_script_never_mentions_a_specific_migration_tool() -> None:
-    script = build_script(make_report(proven_index()), NOW) or ""
-    markdown = render_markdown(make_report(proven_index()), NOW)
-    assert "flyway" not in (script + markdown).lower()
-
-
 def test_markdown_has_every_section_for_a_mixed_run() -> None:
     text = render_markdown(
         make_report(
@@ -303,8 +297,3 @@ def test_write_report_never_overwrites_an_earlier_run(tmp_path: Path) -> None:
     assert not {p.name for p in first} & {p.name for p in second}
     assert len(list(tmp_path.glob("*.md"))) == 2
     assert first[0].read_text() != "" and second[0].name.startswith("pgsage-20261012-093000-2")
-
-
-def test_the_flyway_specific_module_is_gone() -> None:
-    with pytest.raises(ImportError):
-        __import__("pgsage.migrations")

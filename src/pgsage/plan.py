@@ -15,40 +15,17 @@ class PlanNode(BaseModel):
     node_type: str = Field(alias="Node Type")
     relation_name: str | None = Field(default=None, alias="Relation Name")
     schema_name: str | None = Field(default=None, alias="Schema")
-    alias: str | None = Field(default=None, alias="Alias")
     index_name: str | None = Field(default=None, alias="Index Name")
-    join_type: str | None = Field(default=None, alias="Join Type")
-    filter: str | None = Field(default=None, alias="Filter")
-    index_cond: str | None = Field(default=None, alias="Index Cond")
-    sort_key: list[str] | None = Field(default=None, alias="Sort Key")
-    sort_space_type: str | None = Field(default=None, alias="Sort Space Type")
-    startup_cost: float = Field(alias="Startup Cost")
     total_cost: float = Field(alias="Total Cost")
     plan_rows: int = Field(alias="Plan Rows")
-    plan_width: int = Field(default=0, alias="Plan Width")
     actual_rows: float | None = Field(default=None, alias="Actual Rows")
     actual_loops: int | None = Field(default=None, alias="Actual Loops")
-    actual_startup_time: float | None = Field(default=None, alias="Actual Startup Time")
     actual_total_time: float | None = Field(default=None, alias="Actual Total Time")
     rows_removed_by_filter: float | None = Field(default=None, alias="Rows Removed by Filter")
-    sort_method: str | None = Field(default=None, alias="Sort Method")
-    hash_batches: int | None = Field(default=None, alias="Hash Batches")
-    lossy_heap_blocks: int | None = Field(default=None, alias="Lossy Heap Blocks")
-    rows_removed_by_index_recheck: float | None = Field(
-        default=None, alias="Rows Removed by Index Recheck"
-    )
-    shared_hit_blocks: int | None = Field(default=None, alias="Shared Hit Blocks")
-    shared_read_blocks: int | None = Field(default=None, alias="Shared Read Blocks")
-    temp_read_blocks: int | None = Field(default=None, alias="Temp Read Blocks")
-    temp_written_blocks: int | None = Field(default=None, alias="Temp Written Blocks")
-    children: list[PlanNode] = Field(default_factory=lambda: list[PlanNode](), alias="Plans")
     workers_launched: int | None = Field(default=None, alias="Workers Launched")
+    children: list[PlanNode] = Field(default_factory=lambda: list[PlanNode](), alias="Plans")
     in_parallel: bool = Field(default=False, exclude=True)
     parallel_participants: int = Field(default=1, exclude=True)
-
-    @property
-    def analyzed(self) -> bool:
-        return self.actual_rows is not None
 
     @property
     def loops(self) -> int:

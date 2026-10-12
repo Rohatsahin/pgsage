@@ -130,10 +130,9 @@ PASS  full-table-aggregate: no changes proposed
 | `pgsage tune` | fetch plan and table stats, ask the model, prove each proposal, retry with feedback; the query comes from `--sql`, `--file`, `--edit` or stdin |
 | `pgsage tune --dry-run` / `--show-prompt` | build the prompt, print its size (or the whole prompt), call no model |
 | `pgsage tune --report-dir reports/` | also write a Markdown report, a JSON report and a plain SQL script of the proven changes (any migration tool, or `psql -f`) |
-| `pgsage explain [plan.json]` | explain an `EXPLAIN (ANALYZE, FORMAT JSON)` you already have (no database needed) |
+| `pgsage explain [plan.json]` | explain an `EXPLAIN (ANALYZE, FORMAT JSON)` you already have, no database needed; the advice is **unverified**, use `tune` to prove it |
 | `pgsage verify` | prove one index you chose yourself |
 | `pgsage top` | the costliest `SELECT`s from `pg_stat_statements` |
-| `pgsage diff old.json new.json` | exit 1 if the plan shape changed (regression check for CI) |
 | `pgsage eval` | score a model on cases with known fixes (`--oracle` validates the harness, no LLM) |
 
 Options for the model: `--provider anthropic|openai`, `--model`, `--effort low..max`,
