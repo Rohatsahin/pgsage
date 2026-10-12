@@ -9,6 +9,7 @@ MARKDOWN = [
     ROOT / "AGENTS.md",
     ROOT / "CLAUDE.md",
     ROOT / "CONTRIBUTING.md",
+    ROOT / "SECURITY.md",
     *sorted((ROOT / "docs").glob("*.md")),
 ]
 LINK = re.compile(r"\]\(([^)#\s]+)(?:#[^)]*)?\)")

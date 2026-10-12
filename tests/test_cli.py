@@ -149,3 +149,47 @@ def test_explain_exits_2_when_the_model_fails(monkeypatch: pytest.MonkeyPatch) -
     result = runner.invoke(cli.app, ["explain"], input=json.dumps(PLAN))
     assert result.exit_code == 2
     assert "declined" in result.output
+
+
+def test_an_unknown_provider_or_effort_is_a_usage_error() -> None:
+    bad_provider = runner.invoke(
+        cli.app, ["explain", "--provider", "bogus"], input=json.dumps(PLAN)
+    )
+    bad_effort = runner.invoke(cli.app, ["explain", "--effort", "bogus"], input=json.dumps(PLAN))
+    assert bad_provider.exit_code == 2 and bad_effort.exit_code == 2
+    assert "bogus" in bad_provider.output + bad_effort.output
+
+
+def test_a_missing_plan_file_is_an_error_not_a_traceback(tmp_path: Path) -> None:
+    result = runner.invoke(cli.app, ["explain", str(tmp_path / "nope.json")])
+    assert result.exit_code == 2
+    assert result.output.startswith("error:") and "Traceback" not in result.output
+
+
+def test_diff_reports_missing_and_garbage_files(tmp_path: Path) -> None:
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(PLAN))
+    garbage = tmp_path / "garbage.json"
+    garbage.write_text("not json")
+    missing = runner.invoke(cli.app, ["diff", str(good), str(tmp_path / "nope.json")])
+    broken = runner.invoke(cli.app, ["diff", str(good), str(garbage)])
+    assert missing.exit_code == 2 and broken.exit_code == 2
+    assert "Traceback" not in missing.output + broken.output
+
+
+def test_version_flag_prints_the_package_version() -> None:
+    result = runner.invoke(cli.app, ["--version"])
+    assert result.exit_code == 0
+    assert result.output.startswith("pgsage ")
+
+
+def test_every_command_has_a_description_in_the_help() -> None:
+    output = runner.invoke(cli.app, ["--help"]).output
+    for command in ("explain", "tune", "verify", "top", "diff", "eval"):
+        line = next(line for line in output.splitlines() if f" {command} " in line)
+        assert len(line.split(command, 1)[1].strip(" │")) > 10, command
+
+
+def test_the_eval_help_describes_what_it_really_does() -> None:
+    output = runner.invoke(cli.app, ["eval", "--help"]).output
+    assert "pgsage_eval_" in output and "EMPTY" not in output

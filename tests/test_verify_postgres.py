@@ -16,7 +16,7 @@ pytestmark = pytest.mark.docker
 QUERY = "SELECT * FROM orders WHERE customer_id = 7"
 
 
-def test_verified_index_improves_the_plan(pg_dsn: str, pg_conn: psycopg.Connection) -> None:
+def test_verified_index_improves_the_plan(pg_dsn: str) -> None:
     result = verify_index(pg_dsn, QUERY, IndexSuggestion(table="orders", columns=["customer_id"]))
     assert result.before.uses_new_index is False
     assert result.after.uses_new_index is True
@@ -36,6 +36,7 @@ def test_useless_index_is_not_reported_as_improvement(pg_dsn: str) -> None:
     result = verify_index(
         pg_dsn, "SELECT * FROM orders", IndexSuggestion(table="orders", columns=["customer_id"])
     )
+    assert result.after.uses_new_index is False
     assert not result.improved
 
 
@@ -110,8 +111,11 @@ def test_index_ddl_and_names() -> None:
     suggestion = IndexSuggestion(table="orders", columns=["customer_id", "status"], schema_name="s")
     assert suggestion.ddl == 'CREATE INDEX ON "s"."orders" ("customer_id", "status")'
     assert suggestion.suggested_name == "idx_orders_customer_id_status"
-    stats = StatsSuggestion(table="orders", columns=["a", "b"], kinds=["mcv"])
-    assert stats.ddl == 'CREATE STATISTICS "stats_orders_a_b" (mcv) ON "a", "b" FROM "orders"'
+    default = StatsSuggestion(table="orders", columns=["a", "b"])
+    mcv = StatsSuggestion(table="orders", columns=["a", "b"], kinds=["mcv"])
+    assert default.suggested_name == "stats_orders_a_b"
+    assert mcv.suggested_name != default.suggested_name
+    assert mcv.ddl.endswith('(mcv) ON "a", "b" FROM "orders"')
 
 
 def test_partial_index_is_proven_when_the_query_matches_its_predicate(pg_dsn: str) -> None:

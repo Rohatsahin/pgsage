@@ -703,6 +703,7 @@ name = "pgsage"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "click" },
     { name = "httpx" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
@@ -719,8 +720,9 @@ mcp = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "anthropic" },
     { name = "jsonschema" },
-    { name = "psycopg", extra = ["binary"] },
+    { name = "mcp" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-github-actions-annotate-failures" },
@@ -731,6 +733,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=1.13.0" },
+    { name = "click", specifier = ">=8.5.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
@@ -741,8 +744,9 @@ provides-extras = ["anthropic", "mcp"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "anthropic", specifier = ">=1.13.0" },
     { name = "jsonschema", specifier = ">=4.26.0" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
+    { name = "mcp", specifier = ">=2.3.0" },
     { name = "pyright", specifier = ">=1.1.414" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-github-actions-annotate-failures", specifier = ">=0.4.2" },

@@ -1,9 +1,12 @@
+import json
 from pathlib import Path
 
+import psycopg
 import pytest
 from typer.testing import CliRunner
 
 from pgsage import cli
+from pgsage.verify import literal
 from tests.fakes import FakeClient, use_client
 from tests.test_cli import REPLY
 
@@ -40,8 +43,8 @@ def test_verify_rejects_writes(pg_dsn: str) -> None:
     assert result.exit_code == 2
 
 
-def test_tune_apply_dir_writes_only_proven_migrations(
-    pg_dsn: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_tune_report_dir_writes_a_report_json_and_a_runnable_script(
+    pg_dsn: str, pg_conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     use_client(monkeypatch, FakeClient(REPLY))
     result = runner.invoke(
@@ -52,14 +55,55 @@ def test_tune_apply_dir_writes_only_proven_migrations(
             pg_dsn,
             "--sql",
             "SELECT * FROM orders WHERE customer_id = 7",
-            "--apply-dir",
+            "--report-dir",
             str(tmp_path),
         ],
     )
     assert result.exit_code == 0
-    files = list(tmp_path.glob("V*__idx_orders_customer_id.sql"))
-    assert len(files) == 1
-    assert files[0].read_text().startswith("CREATE INDEX IF NOT EXISTS")
+    assert result.output.count("wrote ") == 3
+    markdown = next(tmp_path.glob("*.md")).read_text()
+    assert "## Proven changes" in markdown and "Baseline execution time" in markdown
+    data = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert data["changes"][0]["proven"] is True
+    script = next(tmp_path.glob("*.sql")).read_text()
+    statements = [
+        part.strip()
+        for part in "\n".join(
+            line for line in script.splitlines() if not line.startswith("--")
+        ).split(";")
+        if part.strip()
+    ]
+    try:
+        for statement in statements:
+            pg_conn.execute(literal(statement))
+        row = pg_conn.execute(
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'idx_orders_customer_id'"
+        ).fetchone()
+        assert row == (1,)
+        for statement in statements:
+            pg_conn.execute(literal(statement))
+    finally:
+        pg_conn.execute("DROP INDEX IF EXISTS idx_orders_customer_id")
+
+
+def test_tune_report_dir_can_avoid_concurrently(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    use_client(monkeypatch, FakeClient(REPLY))
+    runner.invoke(
+        cli.app,
+        [
+            "tune",
+            "--dsn",
+            pg_dsn,
+            "--sql",
+            "SELECT * FROM orders WHERE customer_id = 7",
+            "--report-dir",
+            str(tmp_path),
+            "--no-concurrently",
+        ],
+    )
+    assert "CONCURRENTLY" not in next(tmp_path.glob("*.sql")).read_text()
 
 
 def test_eval_oracle_command_passes(pg_dsn: str) -> None:

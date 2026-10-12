@@ -15,7 +15,7 @@ flowchart LR
     A -- no --> F[failed result,<br/>fed back to the model]
     A -- yes --> V[verify<br/>apply, measure, roll back]
     V --> J{proven?}
-    J -- yes --> M[report and<br/>Flyway migration]
+    J -- yes --> M[Markdown report, JSON report<br/>and plain SQL script]
     J -- no --> F
     F -->|next round| B
 ```
@@ -27,15 +27,27 @@ flowchart LR
 1. **Baseline.** `SET LOCAL` timeouts, optional `ANALYZE` (statistics only), then
    `SET TRANSACTION READ ONLY`, then the query three times; the fastest run is kept. Roll back.
 2. **After.** Timeouts, apply the change (`CREATE INDEX` or `CREATE STATISTICS` + `ANALYZE`), then
-   `SET TRANSACTION READ ONLY`, check equivalence (rewrites only), measure three times. Roll back.
+   `SET TRANSACTION READ ONLY`, measure three times. Roll back. For an index, the "new index"
+   set includes the index's partition children, so an index on a partitioned parent is
+   recognised when the plan uses a child index.
+
+Rewrites need no DDL, so `verify_rewrite` runs in one read-only transaction: it checks
+equivalence first (and stops there if it fails), then measures the original and the rewrite
+**interleaved** (A, B, A, B, A, B) so drift and warm-up affect both equally.
+
+Every statement that carries model- or caller-influenced text is executed with the extended
+protocol (`run_single`, `prepare=True`), so PostgreSQL itself refuses a second statement. The
+lexer-based gate is a second layer, not the only one.
 
 `VerifyResult.improved` is true only if there is no error, the result is equivalent (or not
-applicable), the new index is used (indexes), and the speedup is at least 1.1x (or the cost drops
-when no timings exist).
+applicable), the new index is used (indexes), and the change is at least 1.1x **and** 0.5 ms
+faster (or the plan cost drops when no timings exist). The absolute floor keeps a microsecond
+query that "improves" by 18x from being called a win.
 
-Rewrites are compared on column names and types, then on rows as text (`EXCEPT ALL` both ways, or
-an ordered hash when the query has `ORDER BY`). Volatile functions and `LIMIT` without
-`ORDER BY` are never provable.
+Rewrites are compared on column names, types and numeric precision, then on rows as text
+(`EXCEPT ALL` both ways, or an ordered hash when the query has a top-level `ORDER BY`; an
+`ORDER BY` inside a window function does not count). Volatile functions, `LIMIT` without a
+top-level `ORDER BY`, and a rewrite identical to the original are never provable.
 
 ## The trust boundary
 
@@ -59,12 +71,20 @@ Data crosses the boundary twice and is treated as hostile both times. See `docs/
 | `prompts/system.md` | The system prompt; `prompts/__init__.py` loads it |
 | `schema.py` | The JSON schema used for structured output |
 | `tune.py` | Rounds, allow-list, attempt feedback; one `VerifiedChange` per proposal |
-| `migrations.py` | Proven indexes and statistics as `V<timestamp>__<name>.sql` files, collision-proof |
+| `report.py` | Tool-neutral output for a `TuneReport`: a Markdown report for people, a versioned JSON report for tools, and a plain, idempotent SQL script of the proven DDL. Files are timestamped and never overwrite an earlier run |
 | `evals.py` | Cases with known fixes, isolated per-case schemas, an oracle client |
 | `shape.py` | Plan-shape fingerprint and diff, for regression checks |
 | `cli.py`, `mcp_server.py` | Front ends; no logic of their own beyond wiring and printing |
 
 ## Prompt layout and caching
+
+The prompt is built to stay small as queries grow. The data block is compact JSON (indentation
+costs more the deeper a plan nests: a 100-join left-deep plan was about 240,000 tokens indented
+and is about 8,000 compact and pruned). The query is whitespace-normalized after literals are
+tokenized, so that cannot change a literal. A plan over `MAX_PLAN_NODES` (60) nodes sends the
+full `digest` (capped at `MAX_DIGEST_ROWS`, keeping the most expensive rows) and the full detail
+of the `HOTSPOT_NODES` (8) costliest nodes instead of the raw tree. A query over
+`MAX_QUERY_CHARS` (100,000) is refused rather than truncated.
 
 The request is ordered from most to least stable, so the provider can reuse its cache:
 
@@ -83,5 +103,8 @@ call. A test (`test_cache_prefix_is_byte_identical_across_rounds`) guards this.
   models get wrong when asked to compute them from per-loop numbers.
 - **Aliasing instead of dropping names**: the model needs table and column names to propose an
   index, so plain names stay readable and only unusual ones are tokenized and restored locally.
-- **Best of three** measurements, a 1.1x threshold and an unused-index check: a single timing of
-  a small query is noise, and an index the planner ignores is not a fix.
+- **Best of three** measurements, a 1.1x and 0.5 ms threshold and an unused-index check: a single
+  timing of a small query is noise, and an index the planner ignores is not a fix.
+- **Parallel plans**: `self_ms` divides a node's combined worker time by the number of
+  participating processes (`Workers Launched` + 1), so the digest points at the real bottleneck
+  instead of a node whose per-loop time looks tiny.

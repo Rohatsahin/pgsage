@@ -123,7 +123,7 @@ def test_user_defined_side_effects_are_blocked_by_the_read_only_transaction(
     with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
         get_plan(pg_dsn, "SELECT bump()")
     with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
-        verify_rewrite(pg_dsn, "SELECT bump()", "SELECT bump() + 0")
+        verify_rewrite(pg_dsn, "SELECT bump() AS bump", "SELECT bump() + 0 AS bump")
     assert counter_rows(pg_conn) == 0
 
 

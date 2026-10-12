@@ -4,7 +4,9 @@ import json
 from collections.abc import Iterator
 from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+MAX_PLAN_DEPTH = 250
 
 
 class PlanNode(BaseModel):
@@ -40,7 +42,9 @@ class PlanNode(BaseModel):
     temp_read_blocks: int | None = Field(default=None, alias="Temp Read Blocks")
     temp_written_blocks: int | None = Field(default=None, alias="Temp Written Blocks")
     children: list[PlanNode] = Field(default_factory=lambda: list[PlanNode](), alias="Plans")
+    workers_launched: int | None = Field(default=None, alias="Workers Launched")
     in_parallel: bool = Field(default=False, exclude=True)
+    parallel_participants: int = Field(default=1, exclude=True)
 
     @property
     def analyzed(self) -> bool:
@@ -60,7 +64,8 @@ class PlanNode(BaseModel):
     def total_actual_time(self) -> float | None:
         if self.actual_total_time is None:
             return None
-        return self.actual_total_time * (1 if self.in_parallel else self.loops)
+        divisor = self.parallel_participants if self.in_parallel else 1
+        return self.actual_total_time * self.loops / divisor
 
     @property
     def self_time(self) -> float | None:
@@ -101,10 +106,17 @@ class ExplainResult(BaseModel):
     @model_validator(mode="after")
     def _mark_parallel_workers(self) -> ExplainResult:
         for node in self.plan.walk():
-            if node.node_type in ("Gather", "Gather Merge"):
-                for child in node.children:
-                    for below in child.walk():
-                        below.in_parallel = True
+            if node.node_type not in ("Gather", "Gather Merge"):
+                continue
+            participants = (
+                node.workers_launched + 1
+                if node.workers_launched is not None
+                else max((child.loops for child in node.children), default=1)
+            )
+            for child in node.children:
+                for below in child.walk():
+                    below.in_parallel = True
+                    below.parallel_participants = max(participants, 1)
         return self
 
 
@@ -117,7 +129,16 @@ def parse_explain(raw: str | list[Any] | dict[str, Any]) -> ExplainResult:
         data = items[0]
     if not isinstance(data, dict) or "Plan" not in data:
         raise ValueError("input is not EXPLAIN (FORMAT JSON) output: missing 'Plan'")
-    return ExplainResult.model_validate(data)
+    try:
+        return ExplainResult.model_validate(data)
+    except ValidationError as error:
+        first = error.errors()[0]
+        if first["type"] == "recursion_loop":
+            raise ValueError(
+                f"the plan nests more than {MAX_PLAN_DEPTH} levels deep and cannot be parsed"
+            ) from error
+        location = ".".join(str(part) for part in first["loc"])
+        raise ValueError(f"invalid EXPLAIN JSON at {location[:120]}: {first['msg']}") from error
 
 
 def plan_digest(result: ExplainResult) -> list[dict[str, Any]]:
@@ -135,7 +156,11 @@ def plan_digest(result: ExplainResult) -> list[dict[str, Any]]:
                 "actual_rows_total": node.total_actual_rows,
                 "loops": node.loops,
                 "self_ms": None if node.self_time is None else round(node.self_time, 3),
-                "rows_removed_by_filter": node.rows_removed_by_filter,
+                "rows_removed_by_filter": (
+                    None
+                    if node.rows_removed_by_filter is None
+                    else node.rows_removed_by_filter * node.loops
+                ),
                 "estimate_off_by": None if ratio is None else round(max(ratio, 1 / ratio), 1),
             }
         )

@@ -3,15 +3,15 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import Any, Literal, LiteralString, Self, cast
 
 import psycopg
-from psycopg.sql import SQL, Composable
+from psycopg.sql import SQL, Composed
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from pgsage.plan import ExplainResult, parse_explain
-from pgsage.sqlscan import mask, quote_ident, substitute
+from pgsage.sqlscan import is_ambiguous, mask, quote_ident, substitute
 
 READ_ONLY_START = re.compile(r"^[\s(]*(select|with|values|table)\b", re.IGNORECASE)
 FORBIDDEN_KEYWORDS = re.compile(
@@ -33,8 +33,10 @@ VOLATILE_FUNCTIONS = re.compile(
 )
 ORDER_BY = re.compile(r"\border\s+by\b", re.IGNORECASE)
 ROW_LIMIT = re.compile(r"\b(limit|offset|fetch)\b", re.IGNORECASE)
+PLACEHOLDER = re.compile(r"\$\d+")
 
 MIN_SPEEDUP = 1.1
+MIN_ABSOLUTE_GAIN_MS = 0.5
 MEASURE_RUNS = 3
 STATEMENT_TIMEOUT = "60s"
 LOCK_TIMEOUT = "5s"
@@ -107,7 +109,9 @@ def ensure_safe_predicate(predicate: str) -> None:
     if not core or len(predicate) > MAX_PREDICATE_LENGTH:
         raise ValueError("partial index predicate must be 1-500 characters")
     reason = None
-    if _has_comment(predicate):
+    if is_ambiguous(predicate):
+        reason = "unterminated quote or comment, or nested comments"
+    elif _has_comment(predicate):
         reason = "comments are not allowed"
     elif ";" in core:
         reason = "multiple statements are not allowed"
@@ -156,8 +160,12 @@ class IndexSuggestion(_TargetSuggestion):
         plain = self.method == "btree" and not self.include and not self.where
         return _safe_name("idx", self.table, self.columns, () if plain else extra)
 
-    def create_ddl(self, name: str | None = None, if_not_exists: bool = False) -> str:
+    def create_ddl(
+        self, name: str | None = None, if_not_exists: bool = False, concurrently: bool = False
+    ) -> str:
         parts = ["CREATE INDEX"]
+        if concurrently:
+            parts.append("CONCURRENTLY")
         if if_not_exists:
             parts.append("IF NOT EXISTS")
         if name:
@@ -177,12 +185,19 @@ class IndexSuggestion(_TargetSuggestion):
         return self.create_ddl()
 
 
+DEFAULT_STATISTICS_KINDS = ["dependencies", "ndistinct"]
+
+
 class StatsSuggestion(_TargetSuggestion):
-    kinds: list[Literal["dependencies", "ndistinct", "mcv"]] = ["dependencies", "ndistinct"]
+    columns: list[str] = Field(min_length=2)
+    kinds: list[Literal["dependencies", "ndistinct", "mcv"]] = Field(
+        default=["dependencies", "ndistinct"], min_length=1
+    )
 
     @property
     def suggested_name(self) -> str:
-        return _safe_name("stats", self.table, self.columns)
+        default = sorted(self.kinds) == sorted(DEFAULT_STATISTICS_KINDS)
+        return _safe_name("stats", self.table, self.columns, () if default else tuple(self.kinds))
 
     def create_ddl(self, name: str | None = None) -> str:
         label = quote_ident(name or self.suggested_name)
@@ -236,8 +251,9 @@ class VerifyResult(BaseModel):
         if self.kind == "index" and not self.after.uses_new_index:
             return False
         speedup = self.speedup
-        if speedup is not None:
-            return speedup >= MIN_SPEEDUP
+        if speedup is not None and self.before.execution_ms and self.after.execution_ms:
+            gain = self.before.execution_ms - self.after.execution_ms
+            return speedup >= MIN_SPEEDUP and gain >= MIN_ABSOLUTE_GAIN_MS
         return self.after.total_cost < self.before.total_cost
 
 
@@ -248,7 +264,9 @@ class UnsafeStatementError(ValueError):
 def ensure_read_only(sql: str) -> None:
     core = mask(sql).strip().rstrip(";").strip()
     reason = None
-    if ";" in core:
+    if is_ambiguous(sql):
+        reason = "unterminated quote or comment, or nested comments"
+    elif ";" in core:
         reason = "multiple statements are not allowed"
     elif not READ_ONLY_START.match(core):
         reason = "only SELECT/WITH/VALUES/TABLE statements are allowed"
@@ -261,13 +279,26 @@ def ensure_read_only(sql: str) -> None:
         )
 
 
+def ensure_runnable(sql: str) -> None:
+    ensure_read_only(sql)
+    if PLACEHOLDER.search(mask(sql)):
+        raise ValueError(
+            "the query contains $1-style placeholders (pg_stat_statements replaces constants): "
+            "substitute real values first"
+        )
+
+
 def literal(sql: str) -> SQL:
     return SQL(cast("LiteralString", sql))
 
 
+def run_single(conn: psycopg.Connection[Any], query: SQL | Composed) -> psycopg.Cursor[Any]:
+    return conn.execute(query, prepare=True)
+
+
 def run_explain(conn: psycopg.Connection[Any], sql: str) -> ExplainResult:
     statement = SQL("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) {}").format(literal(sql))
-    row = conn.execute(statement).fetchone()
+    row = run_single(conn, statement).fetchone()
     if row is None:
         raise RuntimeError("EXPLAIN returned no rows")
     return parse_explain(row[0])
@@ -287,14 +318,29 @@ def _lock_read_only(conn: psycopg.Connection[Any]) -> None:
     conn.execute("SET TRANSACTION READ ONLY")
 
 
-def _summarize(result: ExplainResult, index_name: str | None = None) -> PlanSummary:
+def measure_interleaved(
+    conn: psycopg.Connection[Any], first: str, second: str, runs: int = MEASURE_RUNS
+) -> tuple[ExplainResult, ExplainResult]:
+    firsts: list[ExplainResult] = []
+    seconds: list[ExplainResult] = []
+    for _ in range(runs):
+        firsts.append(run_explain(conn, first))
+        seconds.append(run_explain(conn, second))
+
+    def fastest(results: list[ExplainResult]) -> ExplainResult:
+        return min(results, key=lambda r: r.execution_time if r.execution_time is not None else 0.0)
+
+    return fastest(firsts), fastest(seconds)
+
+
+def _summarize(result: ExplainResult, new_index_names: Collection[str] = ()) -> PlanSummary:
     nodes = result.nodes()
+    names = set(new_index_names)
     return PlanSummary(
         total_cost=result.plan.total_cost,
         execution_ms=result.execution_time,
         node_types=[node.node_type for node in nodes],
-        uses_new_index=index_name is not None
-        and any(node.index_name == index_name for node in nodes),
+        uses_new_index=bool(names) and any(node.index_name in names for node in nodes),
     )
 
 
@@ -302,47 +348,69 @@ def _strip(sql: str) -> str:
     return sql.strip().rstrip(";").strip()
 
 
-def _unprovable_reason(sql: str) -> str | None:
+def top_level(masked: str) -> str:
+    depth = 0
+    kept: list[str] = []
+    for char in masked:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(depth - 1, 0)
+        elif depth == 0:
+            kept.append(char)
+    return "".join(kept)
+
+
+def unprovable_reason(sql: str) -> str | None:
     core = mask(sql)
+    top = top_level(core)
     if VOLATILE_FUNCTIONS.search(core):
         return "the query calls a volatile function, so its results cannot be compared"
+    if ROW_LIMIT.search(top) and not ORDER_BY.search(top):
+        return "LIMIT/OFFSET/FETCH without a top-level ORDER BY returns an arbitrary subset"
     if ROW_LIMIT.search(core) and not ORDER_BY.search(core):
-        return "LIMIT/OFFSET/FETCH without ORDER BY returns an arbitrary subset"
+        return "a nested LIMIT/OFFSET/FETCH without ORDER BY returns an arbitrary subset"
     return None
 
 
-def _columns(conn: psycopg.Connection[Any], sql: str) -> list[tuple[str, int]]:
+def _columns(
+    conn: psycopg.Connection[Any], sql: str
+) -> list[tuple[str, int, int | None, int | None]]:
     statement = SQL("SELECT * FROM ({}) AS q LIMIT 0").format(literal(_strip(sql)))
-    cursor = conn.execute(statement)
-    return [(column.name, column.type_code) for column in cursor.description or []]
+    cursor = run_single(conn, statement)
+    return [(c.name, c.type_code, c.precision, c.scale) for c in cursor.description or []]
 
 
-def _as_text(sql: str) -> Composable:
+def _as_text(sql: str) -> Composed:
     return SQL("SELECT t::text AS r FROM ({}) AS t").format(literal(_strip(sql)))
 
 
 def _results_equivalent(
     conn: psycopg.Connection[Any], original: str, rewritten: str
 ) -> tuple[bool, str | None]:
-    reason = _unprovable_reason(original) or _unprovable_reason(rewritten)
+    reason = unprovable_reason(original) or unprovable_reason(rewritten)
     if reason:
         return False, reason
     if _columns(conn, original) != _columns(conn, rewritten):
-        return False, "result columns (names or types) differ"
-    if ORDER_BY.search(mask(original)):
+        return False, "result columns (names, types or precision) differ"
+    if ORDER_BY.search(top_level(mask(original))):
         ordered = SQL("SELECT md5(coalesce(string_agg(r, E'\\n'), '')) FROM ({}) AS s")
         hashes = [
-            conn.execute(ordered.format(_as_text(q))).fetchone() for q in (original, rewritten)
+            run_single(conn, ordered.format(_as_text(q))).fetchone() for q in (original, rewritten)
         ]
         if hashes[0] != hashes[1]:
             return False, "ordered results differ"
         return True, None
     for left, right in ((original, rewritten), (rewritten, original)):
         diff = SQL("SELECT count(*) FROM (({}) EXCEPT ALL ({})) AS diff")
-        row = conn.execute(diff.format(_as_text(left), _as_text(right))).fetchone()
+        row = run_single(conn, diff.format(_as_text(left), _as_text(right))).fetchone()
         if row is None or row[0] != 0:
             return False, "result rows differ"
     return True, None
+
+
+def _normalize(sql: str) -> str:
+    return " ".join(_strip(sql).split())
 
 
 def _experiment(
@@ -350,14 +418,10 @@ def _experiment(
     sql: str,
     kind: ChangeKind,
     statement: str,
-    change: Callable[[psycopg.Connection[Any]], None],
+    change: Callable[[psycopg.Connection[Any]], Collection[str] | None],
     before_setup: Callable[[psycopg.Connection[Any]], None] | None = None,
-    after_sql: str | None = None,
-    index_name: str | None = None,
 ) -> VerifyResult:
-    ensure_read_only(sql)
-    if after_sql is not None:
-        ensure_read_only(after_sql)
+    ensure_runnable(sql)
     with psycopg.connect(dsn) as conn:
         try:
             begin_guarded(conn)
@@ -368,51 +432,79 @@ def _experiment(
             conn.rollback()
 
             begin_guarded(conn)
-            change(conn)
+            new_names = change(conn) or ()
             _lock_read_only(conn)
-            equivalent, note = (
-                _results_equivalent(conn, sql, after_sql) if after_sql is not None else (None, None)
-            )
-            after = _summarize(measure(conn, after_sql or sql), index_name)
+            after = _summarize(measure(conn, sql), new_names)
         finally:
             conn.rollback()
-    return VerifyResult(
-        kind=kind,
-        statement=statement,
-        before=before,
-        after=after,
-        equivalent=equivalent,
-        note=note,
-    )
+    return VerifyResult(kind=kind, statement=statement, before=before, after=after)
 
 
 def _unique(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
+FAMILY_SQL = """
+WITH RECURSIVE tree(oid) AS (
+    SELECT c.oid FROM pg_class c WHERE c.relname = %s
+    UNION ALL
+    SELECT i.inhrelid FROM pg_inherits i JOIN tree t ON i.inhparent = t.oid
+)
+SELECT c.relname FROM tree JOIN pg_class c ON c.oid = tree.oid
+"""
+
+
 def verify_index(dsn: str, sql: str, suggestion: IndexSuggestion) -> VerifyResult:
     index_name = _unique("pgsage_verify_idx")
 
-    def change(conn: psycopg.Connection[Any]) -> None:
-        conn.execute(literal(suggestion.create_ddl(index_name)))
+    def change(conn: psycopg.Connection[Any]) -> Collection[str]:
+        run_single(conn, literal(suggestion.create_ddl(index_name)))
+        return [row[0] for row in conn.execute(FAMILY_SQL, (index_name,)).fetchall()]
 
-    return _experiment(dsn, sql, "index", suggestion.ddl, change, index_name=index_name)
+    return _experiment(dsn, sql, "index", suggestion.ddl, change)
 
 
 def verify_statistics(dsn: str, sql: str, suggestion: StatsSuggestion) -> VerifyResult:
     analyze = SQL("ANALYZE {}").format(literal(suggestion.qualified_table))
 
     def before_setup(conn: psycopg.Connection[Any]) -> None:
-        conn.execute(analyze)
+        run_single(conn, analyze)
 
     def change(conn: psycopg.Connection[Any]) -> None:
-        conn.execute(literal(suggestion.create_ddl(_unique("pgsage_verify_stats"))))
-        conn.execute(analyze)
+        run_single(conn, literal(suggestion.create_ddl(_unique("pgsage_verify_stats"))))
+        run_single(conn, analyze)
 
     return _experiment(dsn, sql, "statistics", suggestion.ddl, change, before_setup)
 
 
 def verify_rewrite(dsn: str, sql: str, rewritten: str) -> VerifyResult:
-    return _experiment(
-        dsn, sql, "rewrite", _strip(rewritten), lambda conn: None, after_sql=rewritten
+    ensure_runnable(sql)
+    ensure_runnable(rewritten)
+    statement = _strip(rewritten)
+    if _normalize(sql) == _normalize(rewritten):
+        return VerifyResult.failed("rewrite", statement, "the rewrite is identical to the original")
+    with psycopg.connect(dsn) as conn:
+        try:
+            begin_guarded(conn)
+            _lock_read_only(conn)
+            equivalent, note = _results_equivalent(conn, sql, rewritten)
+            if not equivalent:
+                empty = PlanSummary(total_cost=0.0, execution_ms=None, node_types=[])
+                return VerifyResult(
+                    kind="rewrite",
+                    statement=statement,
+                    before=empty,
+                    after=empty,
+                    equivalent=False,
+                    note=note,
+                )
+            before, after = measure_interleaved(conn, sql, rewritten)
+        finally:
+            conn.rollback()
+    return VerifyResult(
+        kind="rewrite",
+        statement=statement,
+        before=_summarize(before),
+        after=_summarize(after),
+        equivalent=True,
     )

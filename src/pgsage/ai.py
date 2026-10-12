@@ -26,36 +26,41 @@ __all__ = [
     "OpenAICompatibleClient",
     "Redaction",
     "build_prompt",
+    "prompt_stats",
     "explain_plan",
     "parse_explanation",
     "redact_condition",
 ]
 
 DEFAULT_MODEL = "claude-opus-5-5"
-CONDITION_KEYS = {
-    "Filter",
-    "Index Cond",
-    "Recheck Cond",
-    "Join Filter",
-    "Hash Cond",
-    "Merge Cond",
-    "TID Cond",
-    "One-Time Filter",
-    "Order By",
-    "Function Call",
-    "Output",
-    "Sort Key",
-    "Group Key",
-}
 NAME_KEYS = {
     "Relation Name",
     "Schema",
     "Alias",
     "Index Name",
     "CTE Name",
-    "Subplan Name",
     "Function Name",
+    "Trigger Name",
+    "Constraint Name",
+    "Relation",
+    "Table Function Name",
+    "Tuplestore Name",
+    "Target Table",
 }
+SAFE_VALUE_KEYS = {
+    "Node Type",
+    "Parent Relationship",
+    "Join Type",
+    "Strategy",
+    "Partial Mode",
+    "Scan Direction",
+    "Sort Method",
+    "Sort Space Type",
+    "Command",
+    "Operation",
+    "Sampling Method",
+}
+SUBPLAN_NAME = re.compile(r"^(?:InitPlan|SubPlan) \d+(?: \(returns \$\d+(?:,\$\d+)*\))?$")
 PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,62}$")
 TOKEN = re.compile(r"__([LI])(\d+)__")
 CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]+")
@@ -68,6 +73,11 @@ MAX_COLUMNS = 200
 MAX_INDEXES = 50
 MAX_ATTEMPTS = 12
 MAX_ACTIONS = 3
+MAX_QUERY_CHARS = 100_000
+MAX_PLAN_NODES = 60
+MAX_DIGEST_ROWS = 120
+HOTSPOT_NODES = 8
+CHARS_PER_TOKEN = 4
 
 
 class Action(BaseModel):
@@ -197,6 +207,24 @@ class Redaction:
         return name
 
 
+def _sanitize_subplan(value: str, redaction: Redaction) -> str:
+    if SUBPLAN_NAME.match(value):
+        return value
+    if value.startswith("CTE "):
+        return "CTE " + redaction.alias_name(value[4:])
+    return redaction.alias_name(value)
+
+
+def _sanitize_string(key: str, value: str, redaction: Redaction) -> str:
+    if key == "Subplan Name":
+        return _sanitize_subplan(value, redaction)
+    if key in NAME_KEYS or key.endswith(" Name"):
+        return redaction.alias_name(value)
+    if key in SAFE_VALUE_KEYS:
+        return _clean(value)
+    return redaction.condition(value)
+
+
 def _sanitize_plan(value: Any, redaction: Redaction, key: str = "") -> Any:
     if isinstance(value, dict):
         return {
@@ -206,17 +234,32 @@ def _sanitize_plan(value: Any, redaction: Redaction, key: str = "") -> Any:
     if isinstance(value, list):
         return [_sanitize_plan(v, redaction, key) for v in cast("list[Any]", value)]
     if isinstance(value, str):
-        if key in NAME_KEYS:
-            return redaction.alias_name(value)
-        if key in CONDITION_KEYS:
-            return redaction.condition(value)
-        return _clean(value)
+        return _sanitize_string(key, value, redaction)
     return value
 
 
 def redacted_plan(result: ExplainResult, redaction: Redaction | None = None) -> dict[str, Any]:
-    dumped = result.model_dump(by_alias=True, mode="json", exclude_none=True)
-    return _sanitize_plan(dumped, redaction or Redaction())
+    redaction = redaction or Redaction()
+    nodes = result.nodes()
+    if len(nodes) <= MAX_PLAN_NODES:
+        dumped = result.model_dump(by_alias=True, mode="json", exclude_none=True)
+        return _sanitize_plan(dumped, redaction)
+    hottest = sorted(nodes, key=lambda n: n.self_time or 0.0, reverse=True)[:HOTSPOT_NODES]
+    summary: dict[str, Any] = {
+        "omitted": True,
+        "node_count": len(nodes),
+        "note": (
+            f"The raw plan has {len(nodes)} nodes and is omitted to save tokens. `digest` lists "
+            "every node's derived numbers; `hotspots` has the full detail of the costliest nodes."
+        ),
+        "Planning Time": result.planning_time,
+        "Execution Time": result.execution_time,
+        "hotspots": [
+            n.model_dump(by_alias=True, mode="json", exclude_none=True, exclude={"children"})
+            for n in hottest
+        ],
+    }
+    return _sanitize_plan({k: v for k, v in summary.items() if v is not None}, redaction)
 
 
 def _sanitize_digest(digest: list[dict[str, Any]], redaction: Redaction) -> list[dict[str, Any]]:
@@ -228,6 +271,23 @@ def _sanitize_digest(digest: list[dict[str, Any]], redaction: Redaction) -> list
         }
         for row in digest
     ]
+
+
+def _digest_rows(result: ExplainResult, redaction: Redaction) -> dict[str, Any]:
+    digest = plan_digest(result)
+    if len(digest) <= MAX_DIGEST_ROWS:
+        return {"digest": _sanitize_digest(digest, redaction)}
+    keep = {
+        id(row)
+        for row in sorted(digest, key=lambda r: r.get("self_ms") or 0.0, reverse=True)[
+            :MAX_DIGEST_ROWS
+        ]
+    }
+    kept = [row for row in digest if id(row) in keep]
+    return {
+        "digest": _sanitize_digest(kept, redaction),
+        "digest_rows_omitted": len(digest) - len(kept),
+    }
 
 
 def _sanitize_table(table: dict[str, Any], redaction: Redaction) -> dict[str, Any]:
@@ -259,8 +319,22 @@ def _sanitize_attempt(attempt: dict[str, Any], redaction: Redaction) -> dict[str
     clean["statement"] = _clean(redaction.apply(str(attempt.get("statement", ""))), 600)
     for key in ("error", "note"):
         if clean.get(key):
-            clean[key] = redaction.message(str(clean[key]))
+            clean[key] = _clean(redaction.apply(str(clean[key])))
     return clean
+
+
+def _compact(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), default=str)
+
+
+def prompt_stats(system: str, prompt: Prompt) -> dict[str, int]:
+    return {
+        "system_chars": len(system),
+        "prompt_chars": len(prompt),
+        "stable_chars": prompt.stable_length,
+        "volatile_chars": len(prompt) - prompt.stable_length,
+        "approx_tokens": (len(system) + len(prompt)) // CHARS_PER_TOKEN,
+    }
 
 
 def build_prompt(
@@ -271,19 +345,22 @@ def build_prompt(
     redaction: Redaction | None = None,
 ) -> Prompt:
     redaction = redaction or Redaction()
-    payload: dict[str, Any] = {
-        "plan": redacted_plan(result, redaction),
-        "digest": _sanitize_digest(plan_digest(result), redaction),
-    }
+    if sql and len(sql) > MAX_QUERY_CHARS:
+        raise ValueError(
+            f"the query is {len(sql):,} characters; the limit is {MAX_QUERY_CHARS:,}. "
+            "Tune a smaller query, or one sub-select at a time."
+        )
+    payload: dict[str, Any] = {"plan": redacted_plan(result, redaction)}
+    payload.update(_digest_rows(result, redaction))
     if sql:
-        payload["query"] = _clean(redaction.apply(sql), 4000)
+        payload["query"] = " ".join(redaction.apply(sql).split())
     if tables:
         payload["tables"] = [_sanitize_table(t, redaction) for t in tables[:MAX_TABLES]]
-    stable_body = json.dumps(payload, indent=2, default=str)
+    stable_body = _compact(payload)
     volatile_body = ""
     if attempts:
         recent = [_sanitize_attempt(a, redaction) for a in attempts[-MAX_ATTEMPTS:]]
-        volatile_body = json.dumps({"previous_attempts": recent}, indent=2, default=str) + "\n"
+        volatile_body = _compact({"previous_attempts": recent}) + "\n"
     while redaction.nonce in stable_body or redaction.nonce in volatile_body:
         redaction.nonce = secrets.token_hex(8)
     token = redaction.nonce
@@ -404,6 +481,17 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 ANTHROPIC_MAX_TOKENS = 16000
 
 
+def _llm_failure(error: Exception) -> str:
+    text = str(error).splitlines()[0] if str(error) else ""
+    lowered = text.lower()
+    if "authentication method" in lowered or "api key" in lowered or "api_key" in lowered:
+        return (
+            "no usable Anthropic credentials: set ANTHROPIC_API_KEY (or run `ant auth login`)"
+            f" [{type(error).__name__}]"
+        )
+    return f"LLM request failed ({type(error).__name__}): {text[:300]}"
+
+
 class AnthropicClient:
     def __init__(
         self,
@@ -449,12 +537,15 @@ class AnthropicClient:
 
     def complete(self, system: str, prompt: str) -> str:
         request = self.request(system, prompt)
-        if self._use_fallbacks:
-            response = self._client.beta.messages.create(
-                betas=[FALLBACK_BETA], fallbacks="default", **request
-            )
-        else:
-            response = self._client.messages.create(**request)
+        try:
+            if self._use_fallbacks:
+                response = self._client.beta.messages.create(
+                    betas=[FALLBACK_BETA], fallbacks="default", **request
+                )
+            else:
+                response = self._client.messages.create(**request)
+        except Exception as error:
+            raise ExplanationError(_llm_failure(error)) from error
         self._record_usage(response)
         if response.stop_reason == "refusal":
             details = getattr(response, "stop_details", None)
@@ -462,6 +553,8 @@ class AnthropicClient:
             raise ExplanationError(f"the model declined the request (category: {category})")
         if response.stop_reason == "max_tokens":
             raise ExplanationError("the model response was cut off (max_tokens); retry")
+        if response.stop_reason not in ("end_turn", "stop_sequence", None):
+            raise ExplanationError(f"unexpected stop_reason from the model: {response.stop_reason}")
         return "".join(block.text for block in response.content if block.type == "text")
 
     def _record_usage(self, response: Any) -> None:
@@ -496,18 +589,18 @@ class OpenAICompatibleClient:
         self._model = model
 
     def complete(self, system: str, prompt: str) -> str:
-        response = self._client.post(
-            "/chat/completions",
-            json={
-                "model": self._model,
-                "temperature": 0,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": str(prompt)},
-                ],
-            },
-        )
         try:
+            response = self._client.post(
+                "/chat/completions",
+                json={
+                    "model": self._model,
+                    "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": str(prompt)},
+                    ],
+                },
+            )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
         except (httpx.HTTPError, KeyError, IndexError, ValueError) as error:

@@ -42,7 +42,7 @@ def test_identical_semantics_are_equivalent_even_for_json_columns(pg_dsn: str, e
         ("SELECT id FROM eq ORDER BY id DESC", "SELECT id FROM eq", "ordered"),
         ("SELECT id FROM eq WHERE grp = 1", "SELECT id FROM eq WHERE grp = 2", "rows"),
         ("SELECT id FROM eq LIMIT 5", "SELECT id FROM eq ORDER BY id LIMIT 5", "arbitrary"),
-        ("SELECT random() FROM eq", "SELECT random() FROM eq", "volatile"),
+        ("SELECT random() FROM eq", "SELECT random() FROM eq WHERE true", "volatile"),
     ],
 )
 def test_not_equivalent_or_unprovable(
@@ -60,3 +60,51 @@ def test_ordered_queries_are_compared_in_order(pg_dsn: str, eq: None) -> None:
         "SELECT id FROM eq WHERE grp = 1 ORDER BY id ASC",
     )
     assert equivalent is True
+
+
+def test_a_rewrite_that_returns_extra_rows_is_not_equivalent(pg_dsn: str, eq: None) -> None:
+    equivalent, note = check(
+        pg_dsn,
+        "SELECT id FROM eq WHERE grp = 1",
+        "SELECT id FROM eq WHERE grp IN (1, 2)",
+    )
+    assert equivalent is False
+    assert note == "result rows differ"
+
+
+def test_a_rewrite_that_returns_fewer_rows_is_not_equivalent(pg_dsn: str, eq: None) -> None:
+    equivalent, _ = check(
+        pg_dsn,
+        "SELECT id FROM eq WHERE grp IN (1, 2)",
+        "SELECT id FROM eq WHERE grp = 1",
+    )
+    assert equivalent is False
+
+
+def test_numeric_precision_and_scale_are_part_of_the_column_identity(pg_dsn: str, eq: None) -> None:
+    equivalent, note = check(
+        pg_dsn,
+        "SELECT id::numeric(10,2) AS v FROM eq",
+        "SELECT id::numeric AS v FROM eq",
+    )
+    assert equivalent is False
+    assert note is not None and "columns" in note
+
+
+def test_a_window_order_by_does_not_switch_on_ordered_comparison(pg_dsn: str, eq: None) -> None:
+    equivalent, _ = check(
+        pg_dsn,
+        "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM eq WHERE grp = 1",
+        "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM eq WHERE 1 = grp",
+    )
+    assert equivalent is True
+
+
+def test_a_limit_with_only_a_window_order_by_is_unprovable(pg_dsn: str, eq: None) -> None:
+    equivalent, note = check(
+        pg_dsn,
+        "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM eq LIMIT 5",
+        "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM eq WHERE true LIMIT 5",
+    )
+    assert equivalent is False
+    assert note is not None and "top-level ORDER BY" in note

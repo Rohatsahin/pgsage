@@ -4,8 +4,9 @@ import re
 from collections.abc import Callable
 
 LEXEME = re.compile(
-    r"(?P<comment>--[^\n]*|/\*.*?\*/)"
-    r"|(?P<string>[eE]'(?:[^'\\]|\\.|'')*'|'(?:[^']|'')*'|\$(?P<tag>\w*)\$.*?\$(?P=tag)\$)"
+    r"(?P<comment>--[^\n\r]*|/\*.*?\*/)"
+    r"|(?P<string>(?<![\w$])[eE]'(?:[^'\\]|\\.|'')*'|'(?:[^']|'')*'"
+    r"|\$(?P<tag>(?:[^\W\d]\w*)?)\$.*?\$(?P=tag)\$)"
     r"|(?P<ident>\"(?:[^\"]|\"\")*\")"
     r"|(?P<number>(?<![\w\"$])-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w\"]))",
     re.DOTALL,
@@ -41,3 +42,11 @@ def redact_condition(text: str) -> str:
 
 def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def is_ambiguous(sql: str) -> bool:
+    def handler(kind: str, text: str) -> str:
+        return {"comment": " ", "string": "\x01", "ident": "\x02"}.get(kind, text)
+
+    residue = substitute(sql, handler)
+    return any(token in residue for token in ("'", '"', "/*", "*/"))

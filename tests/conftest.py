@@ -1,6 +1,7 @@
 import json
+import shutil
+import subprocess
 from collections.abc import Iterator
-from pathlib import Path
 from typing import LiteralString, cast
 
 import psycopg
@@ -8,7 +9,29 @@ import pytest
 from psycopg.sql import SQL
 from testcontainers.community.postgres import PostgresContainer
 
-FIXTURES = Path(__file__).parent / "fixtures"
+
+def _docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    needs_docker = [
+        item
+        for item in items
+        if "pg_dsn" in getattr(item, "fixturenames", ()) or item.get_closest_marker("docker")
+    ]
+    if not needs_docker or _docker_available():
+        return
+    skip = pytest.mark.skip(
+        reason="Docker is not available; run with a Docker daemon or -m 'not docker'"
+    )
+    for item in needs_docker:
+        item.add_marker(skip)
 
 
 @pytest.fixture(scope="session")
@@ -29,14 +52,6 @@ def pg_dsn() -> Iterator[str]:
 def pg_conn(pg_dsn: str) -> Iterator[psycopg.Connection]:
     with psycopg.connect(pg_dsn, autocommit=True) as conn:
         yield conn
-
-
-@pytest.fixture
-def load_fixture():
-    def _load(name: str) -> str:
-        return (FIXTURES / name).read_text()
-
-    return _load
 
 
 def explain_json(conn: psycopg.Connection, sql: str, analyze: bool = True) -> str:

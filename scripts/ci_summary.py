@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import sys
 import xml.etree.ElementTree as ET
@@ -19,6 +20,9 @@ OUTCOME_ICON = {"success": "✅", "failure": "❌", "cancelled": "🚫", "skippe
 SLOWEST = 5
 MAX_FAILURES_SHOWN = 10
 MAX_MESSAGE_LINES = 12
+MAX_LINE_LENGTH = 300
+MAX_SUMMARY_BYTES = 900_000
+NON_GATING_STEPS = {"pull"}
 
 
 @dataclass
@@ -42,15 +46,25 @@ class Report:
         return sum(c.seconds for c in self.cases)
 
 
-def parse_junit(path: Path) -> Report:
+def _split_classname(classname: str) -> tuple[str, str]:
+    parts = classname.split(".")
+    module = max((i for i, p in enumerate(parts) if p.startswith("test_")), default=None)
+    if module is None:
+        return classname, ""
+    return "/".join(parts[: module + 1]) + ".py", ".".join(parts[module + 1 :])
+
+
+def parse_junit(path: Path) -> tuple[Report, bool]:
     report = Report()
     if not path.exists():
-        return report
-    for case in ET.parse(path).getroot().iter("testcase"):
-        classname = case.get("classname", "")
-        parts = classname.split(".")
-        module = next((i for i, p in enumerate(parts) if p.startswith("test_")), None)
-        file = "/".join(parts[: module + 1]) + ".py" if module is not None else classname
+        return report, False
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        return report, False
+    for case in root.iter("testcase"):
+        file, nested = _split_classname(case.get("classname", ""))
+        name = case.get("name", "?")
         status, message = "passed", ""
         for child in case:
             if child.tag in ("failure", "error"):
@@ -58,18 +72,32 @@ def parse_junit(path: Path) -> Report:
             elif child.tag == "skipped":
                 status, message = "skipped", child.get("message") or ""
         report.cases.append(
-            Case(file, case.get("name", "?"), float(case.get("time", "0") or 0), status, message)
+            Case(
+                file,
+                f"{nested}::{name}" if nested else name,
+                float(case.get("time", "0") or 0),
+                status,
+                message,
+            )
         )
-    return report
+    return report, True
 
 
 def verdict(outcomes: dict[str, str], report: Report) -> bool:
-    steps_ok = all(outcome in ("success", "skipped") for outcome in outcomes.values())
+    steps_ok = all(
+        outcome in ("success", "skipped")
+        for key, outcome in outcomes.items()
+        if key not in NON_GATING_STEPS
+    )
     return steps_ok and report.count("failed") == 0
 
 
 def _trim(message: str) -> str:
-    lines = [line.rstrip() for line in message.strip().splitlines() if line.strip()]
+    lines = [
+        line.rstrip()[:MAX_LINE_LENGTH] + ("…" if len(line.rstrip()) > MAX_LINE_LENGTH else "")
+        for line in message.strip().splitlines()
+        if line.strip()
+    ]
     shown = lines[:MAX_MESSAGE_LINES]
     if len(lines) > len(shown):
         shown.append(f"... {len(lines) - len(shown)} more lines")
@@ -88,7 +116,10 @@ def render(outcomes: dict[str, str], report: Report, python: str, junit_found: b
         out.append(f"| {label} | {OUTCOME_ICON.get(outcome, '❔')} {outcome} |")
     out.append("")
     if not junit_found:
-        out += ["> ⚠️ No test report was produced; the tests step did not run to completion.", ""]
+        out += [
+            "> ⚠️ No readable test report was produced; the tests step did not run to completion.",
+            "",
+        ]
         return "\n".join(out)
     out.append("### 🧪 Tests")
     out.append(
@@ -112,17 +143,17 @@ def render(outcomes: dict[str, str], report: Report, python: str, junit_found: b
     slow = sorted(report.cases, key=lambda c: c.seconds, reverse=True)[:SLOWEST]
     out.append(f"<details><summary>🐢 {len(slow)} slowest tests</summary>")
     out += ["", "| Test | Time |", "| --- | ---: |"]
-    out += [f"| `{c.file}::{c.name}` | {c.seconds:.2f}s |" for c in slow]
+    out += [f"| `{c.file}::{c.name}` | {c.seconds:.2f}s |".replace("<", "&lt;") for c in slow]
     out += ["", "</details>", ""]
     failures = [c for c in report.cases if c.status == "failed"]
     if failures:
         out.append(f"### ❌ {len(failures)} failing test(s)")
         for case in failures[:MAX_FAILURES_SHOWN]:
             out += [
-                f"<details open><summary>❌ <code>{case.file}::{case.name}</code></summary>",
+                f"<details open><summary>❌ <code>{html.escape(case.file)}::{html.escape(case.name)}</code></summary>",
                 "",
                 "```text",
-                _trim(case.message),
+                _trim(case.message).replace("```", "` ` `"),
                 "```",
                 "",
                 "</details>",
@@ -156,8 +187,12 @@ def main(argv: list[str]) -> int:
         for key, _ in STEPS
         if (value := os.environ.get(f"STEP_{key.upper()}")) is not None
     }
-    report = parse_junit(junit)
-    markdown = render(outcomes, report, python, junit.exists())
+    report, readable = parse_junit(junit)
+    markdown = render(outcomes, report, python, readable)
+    if len(markdown.encode()) > MAX_SUMMARY_BYTES:
+        markdown = (
+            markdown.encode()[:MAX_SUMMARY_BYTES].decode(errors="ignore") + "\n\n…summary truncated"
+        )
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if target:
         with open(target, "a", encoding="utf-8") as handle:

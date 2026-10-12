@@ -3,6 +3,7 @@ name = "pgsage"
 version = "0.1.0"
 description = "AI-native PostgreSQL query tuning: an LLM proposes, Postgres proves"
 license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["postgresql", "explain", "query-tuning", "llm", "mcp", "performance"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -15,11 +16,15 @@ classifiers = [
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "click>=8.5.0",
     "httpx>=0.28.1",
     "psycopg[binary]>=3.3.6",
     "pydantic>=2.14.1",
     "typer>=0.27.3",
 ]
+
+[tool.uv.build-backend]
+source-include = ["LICENSE", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "SECURITY.md", "docs/**", "assets/**", "tests/**", "scripts/**", "Makefile"]
 
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]
@@ -27,8 +32,9 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "anthropic>=1.13.0",
     "jsonschema>=4.26.0",
-    "psycopg[binary]>=3.3.6",
+    "mcp>=2.3.0",
     "pyright>=1.1.414",
     "pytest>=9.1.1",
     "pytest-github-actions-annotate-failures>=0.4.2",
@@ -38,7 +44,7 @@ dev = [
 
 [project.scripts]
 pgsage = "pgsage.cli:app"
-pgsage-mcp = "pgsage.mcp_server:main"
+pgsage-mcp = "pgsage.mcp_main:main"
 
 [project.optional-dependencies]
 anthropic = [

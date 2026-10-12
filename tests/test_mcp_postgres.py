@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 import pytest
 from mcp import Client
@@ -82,3 +83,36 @@ async def test_partial_and_covering_indexes_can_be_verified_through_mcp() -> Non
     assert not partial.is_error
     assert json.loads(first.text)["statement"].endswith("WHERE customer_id = 7")
     assert unsafe.is_error
+
+
+async def error_text(tool: str, arguments: dict[str, Any]) -> str:
+    async with Client(server) as client:
+        result = await client.call_tool(tool, arguments)
+    assert result.is_error
+    first = result.content[0]
+    assert isinstance(first, TextContent)
+    return first.text
+
+
+@pytest.mark.anyio
+async def test_an_agent_is_told_why_a_call_failed() -> None:
+    assert "not found" in await error_text("get_table_info", {"table": "nope"})
+    assert "single read-only" in await error_text(
+        "verify_query_rewrite", {"sql": QUERY, "rewritten_sql": "DELETE FROM orders"}
+    )
+    assert "at least 1" in await error_text("get_top_queries", {"limit": -1})
+    assert "placeholders" in await error_text("get_query_plan", {"sql": "SELECT $1"})
+
+
+@pytest.mark.anyio
+async def test_database_errors_reach_the_agent_with_their_type() -> None:
+    text = await error_text(
+        "verify_index_suggestion", {"sql": QUERY, "table": "orders", "columns": ["no_such_column"]}
+    )
+    assert "UndefinedColumn" in text
+
+
+@pytest.mark.anyio
+async def test_a_missing_dsn_says_what_to_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PGSAGE_DSN")
+    assert "PGSAGE_DSN" in await error_text("get_query_plan", {"sql": QUERY})

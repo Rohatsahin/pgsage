@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -24,6 +24,7 @@ jobs:
         python: ["3.12", "3.13"]
     env:
       PYTHON_VERSION: ${{ matrix.python }}
+      UV_LOCKED: "1"
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
@@ -105,3 +106,59 @@ jobs:
             fi
           done
           exit "${failed:-0}"
+
+  package:
+    name: 📦 Wheel smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: 🏗️ Build wheel and sdist
+        run: uv build
+
+      - name: 🧪 Install the wheel with no extras and run it
+        run: |
+          uv venv /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/pgsage --version
+          /tmp/smoke/bin/pgsage --help
+          /tmp/smoke/bin/python -c "import pgsage.cli"
+          /tmp/smoke/bin/python -m pgsage --version
+          set +e
+          /tmp/smoke/bin/pgsage-mcp 2>/tmp/mcp.err
+          code=$?
+          set -e
+          cat /tmp/mcp.err
+          if [ "$code" != "2" ] || ! grep -q "pgsage\[mcp\]" /tmp/mcp.err; then
+            echo "❌ pgsage-mcp should exit 2 with an install hint when the mcp extra is missing"
+            exit 1
+          fi
+          echo "✅ base install works and the missing extra is reported clearly"
+
+      - name: 🔎 Check the package contents
+        run: |
+          python3 - <<'PY'
+          import glob, tarfile, zipfile
+          wheel = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist()
+          sdist = tarfile.open(glob.glob("dist/*.tar.gz")[0]).getnames()
+          required = ["pgsage/prompts/system.md", "pgsage/py.typed"]
+          missing = [n for n in required if n not in wheel]
+          assert not missing, f"missing from wheel: {missing}"
+          assert any(n.endswith("LICENSE") for n in wheel), "LICENSE missing from wheel"
+          assert any(n.endswith("/LICENSE") for n in sdist), "LICENSE missing from sdist"
+          print("✅ wheel and sdist contain the prompt, py.typed and the LICENSE")
+          PY
+
+      - name: 📎 Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
