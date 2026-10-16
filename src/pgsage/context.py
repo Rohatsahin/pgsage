@@ -3,10 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 import psycopg
-from psycopg.rows import dict_row
 
-from pgsage.plan import ExplainResult
-from pgsage.sqlscan import redact_condition
+from pgsage.db import connect, connect_dicts
+from pgsage.plan import ExplainResult, plan_digest
 from pgsage.verify import begin_guarded, ensure_runnable, run_explain
 
 COLUMNS_SQL = """
@@ -69,7 +68,7 @@ def _read_only(conn: psycopg.Connection[Any]) -> None:
 
 def get_plan(dsn: str, sql: str) -> ExplainResult:
     ensure_runnable(sql)
-    with psycopg.connect(dsn) as conn:
+    with connect(dsn) as conn:
         _read_only(conn)
         try:
             return run_explain(conn, sql)
@@ -78,7 +77,7 @@ def get_plan(dsn: str, sql: str) -> ExplainResult:
 
 
 def table_info(dsn: str, table: str, schema: str = "public") -> dict[str, Any]:
-    with psycopg.Connection[dict[str, Any]].connect(dsn, row_factory=dict_row) as conn:
+    with connect_dicts(dsn) as conn:
         _read_only(conn)
         params = (schema, table)
         columns = conn.execute(COLUMNS_SQL, params).fetchall()
@@ -90,17 +89,14 @@ def table_info(dsn: str, table: str, schema: str = "public") -> dict[str, Any]:
             "schema": schema,
             "name": table,
             "columns": columns,
-            "indexes": [
-                {**index, "indexdef": redact_condition(index["indexdef"])}
-                for index in conn.execute(INDEXES_SQL, params).fetchall()
-            ],
+            "indexes": [index for index in conn.execute(INDEXES_SQL, params).fetchall()],
             "size": size,
             "column_stats": conn.execute(STATS_SQL, params).fetchall(),
         }
 
 
 def table_ancestors(dsn: str, table: str, schema: str = "public") -> list[tuple[str, str]]:
-    with psycopg.connect(dsn) as conn:
+    with connect(dsn) as conn:
         _read_only(conn)
         rows = conn.execute(ANCESTORS_SQL, (schema, table, schema, table)).fetchall()
         return [(row[0], row[1]) for row in rows]
@@ -117,7 +113,7 @@ def tables_in_plan(result: ExplainResult) -> list[tuple[str, str]]:
 def top_queries(dsn: str, limit: int = 10, min_calls: int = 1) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("limit must be at least 1")
-    with psycopg.Connection[dict[str, Any]].connect(dsn, row_factory=dict_row) as conn:
+    with connect_dicts(dsn) as conn:
         _read_only(conn)
         try:
             return conn.execute(
@@ -132,3 +128,34 @@ def top_queries(dsn: str, limit: int = 10, min_calls: int = 1) -> list[dict[str,
             raise ValueError(
                 "this pg_stat_statements has no total_exec_time column: pgsage top needs PostgreSQL 13+"
             ) from error
+
+
+def collect_tables(dsn: str, plan_tables: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    collected: dict[tuple[str, str], dict[str, Any]] = {}
+    for schema, name in plan_tables:
+        for candidate_schema, candidate_name in [
+            (schema, name),
+            *table_ancestors(dsn, name, schema),
+        ]:
+            if (candidate_schema, candidate_name) in collected:
+                continue
+            try:
+                collected[(candidate_schema, candidate_name)] = table_info(
+                    dsn, candidate_name, candidate_schema
+                )
+            except ValueError:
+                continue
+    return list(collected.values())
+
+
+def inspect_query(dsn: str, sql: str, raw_plan: bool = False) -> dict[str, Any]:
+    plan = get_plan(dsn, sql)
+    found: dict[str, Any] = {
+        "query": sql,
+        "baseline_ms": plan.execution_time,
+        "digest": plan_digest(plan),
+        "tables": collect_tables(dsn, tables_in_plan(plan)),
+    }
+    if raw_plan:
+        found["plan"] = plan.model_dump(by_alias=True, mode="json", exclude_none=True)
+    return found

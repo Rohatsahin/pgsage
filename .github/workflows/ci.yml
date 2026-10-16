@@ -21,13 +21,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.12", "3.13"]
+        python: ["3.12", "3.13", "3.14"]
     env:
       PYTHON_VERSION: ${{ matrix.python }}
       UV_LOCKED: "1"
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: 🐍 Set up uv and Python ${{ matrix.python }}
         uses: astral-sh/setup-uv@v5
@@ -114,6 +116,8 @@ jobs:
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: 🐍 Set up uv
         uses: astral-sh/setup-uv@v5
@@ -132,6 +136,13 @@ jobs:
           /tmp/smoke/bin/pgsage --help
           /tmp/smoke/bin/python -c "import pgsage.cli"
           /tmp/smoke/bin/python -m pgsage --version
+          /tmp/smoke/bin/pgsage install-skill --dir /tmp/skills
+          test -s /tmp/skills/pgsage/SKILL.md
+          grep -q "^name: pgsage" /tmp/skills/pgsage/SKILL.md
+          cd "$(mktemp -d)"
+          /tmp/smoke/bin/pgsage init
+          /tmp/smoke/bin/pgsage connections | grep -q '"name": "scratch"'
+          cd -
           set +e
           /tmp/smoke/bin/pgsage-mcp 2>/tmp/mcp.err
           code=$?
@@ -141,7 +152,7 @@ jobs:
             echo "❌ pgsage-mcp should exit 2 with an install hint when the mcp extra is missing"
             exit 1
           fi
-          echo "✅ base install works and the missing extra is reported clearly"
+          echo "✅ base install works, the skill installs, and the missing extra is reported clearly"
 
       - name: 🔎 Check the package contents
         run: |
@@ -149,12 +160,12 @@ jobs:
           import glob, tarfile, zipfile
           wheel = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist()
           sdist = tarfile.open(glob.glob("dist/*.tar.gz")[0]).getnames()
-          required = ["pgsage/prompts/system.md", "pgsage/py.typed"]
+          required = ["pgsage/skill/SKILL.md", "pgsage/py.typed"]
           missing = [n for n in required if n not in wheel]
           assert not missing, f"missing from wheel: {missing}"
           assert any(n.endswith("LICENSE") for n in wheel), "LICENSE missing from wheel"
           assert any(n.endswith("/LICENSE") for n in sdist), "LICENSE missing from sdist"
-          print("✅ wheel and sdist contain the prompt, py.typed and the LICENSE")
+          print("✅ wheel and sdist contain the skill, py.typed and the LICENSE")
           PY
 
       - name: 📎 Upload distributions

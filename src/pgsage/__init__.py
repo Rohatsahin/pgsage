@@ -1,9 +1,15 @@
 from importlib.metadata import PackageNotFoundError, version
 
-from pgsage.ai import Action, Explanation, explain_plan
+from pgsage.context import inspect_query
 from pgsage.plan import ExplainResult, PlanNode, parse_explain, plan_digest
-from pgsage.tune import TuneReport, tune
-from pgsage.verify import IndexSuggestion, VerifyResult, verify_index
+from pgsage.verify import (
+    IndexSuggestion,
+    StatsSuggestion,
+    VerifyResult,
+    verify_index,
+    verify_rewrite,
+    verify_statistics,
+)
 
 try:
     __version__ = version("pgsage")
@@ -11,17 +17,16 @@ except PackageNotFoundError:
     __version__ = "0+unknown"
 
 __all__ = [
-    "Action",
     "ExplainResult",
-    "Explanation",
     "IndexSuggestion",
     "PlanNode",
-    "TuneReport",
+    "StatsSuggestion",
     "VerifyResult",
     "__version__",
-    "explain_plan",
+    "inspect_query",
     "parse_explain",
     "plan_digest",
-    "tune",
     "verify_index",
+    "verify_rewrite",
+    "verify_statistics",
 ]

@@ -10,6 +10,7 @@ import psycopg
 from psycopg.sql import SQL, Composed
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from pgsage.db import connect, describe_error
 from pgsage.plan import ExplainResult, parse_explain
 from pgsage.sqlscan import is_ambiguous, mask, quote_ident, substitute
 
@@ -17,7 +18,7 @@ READ_ONLY_START = re.compile(r"^[\s(]*(select|with|values|table)\b", re.IGNORECA
 FORBIDDEN_KEYWORDS = re.compile(
     r"\b(insert|update|delete|merge|alter|drop|create|truncate|grant|revoke|copy|call|do|vacuum|"
     r"reindex|refresh|lock|notify|listen|unlisten|commit|rollback|savepoint|into|set|reset|"
-    r"prepare|execute|declare|fetch)\b|\bfor\s+(no\s+key\s+)?(update|share)\b|\bfor\s+key\s+share\b",
+    r"prepare|execute|declare)\b|\bfor\s+(no\s+key\s+)?(update|share)\b|\bfor\s+key\s+share\b",
     re.IGNORECASE,
 )
 FORBIDDEN_FUNCTIONS = re.compile(
@@ -35,6 +36,16 @@ ORDER_BY = re.compile(r"\border\s+by\b", re.IGNORECASE)
 ROW_LIMIT = re.compile(r"\b(limit|offset|fetch)\b", re.IGNORECASE)
 PLACEHOLDER = re.compile(r"\$\d+")
 
+MAX_IDENTIFIER_BYTES = 63
+TIMEOUT_NOTE = (
+    "a statement timed out (60 s limit); a proof runs the query several times, so use a query "
+    "that finishes in a few seconds"
+)
+PARTITIONED_NOTE = (
+    "partitioned table: CREATE INDEX CONCURRENTLY is not supported on the parent, so the apply "
+    "SQL builds the index without it (writes are blocked while it runs)"
+)
+DATA_ERROR_CLASSES = ("22", "42")
 MIN_SPEEDUP = 1.1
 MIN_ABSOLUTE_GAIN_MS = 0.5
 MEASURE_RUNS = 3
@@ -52,10 +63,11 @@ def _safe_name(prefix: str, table: str, columns: list[str], extra: tuple[str, ..
     parts = [_identifier_part(p) for p in (table, *columns)]
     readable = f"{prefix}_{'_'.join(parts)}"
     lossy = parts != [table, *columns]
-    if not lossy and not extra and len(readable) <= 63:
+    if not lossy and not extra and len(readable.encode()) <= MAX_IDENTIFIER_BYTES:
         return readable
     digest = hashlib.sha1("\0".join((table, *columns, *extra)).encode()).hexdigest()[:8]
-    return f"{readable[:54]}_{digest}"
+    head = readable.encode()[: MAX_IDENTIFIER_BYTES - len(digest) - 1].decode(errors="ignore")
+    return f"{head}_{digest}"
 
 
 class _TargetSuggestion(BaseModel):
@@ -185,14 +197,13 @@ class IndexSuggestion(_TargetSuggestion):
         return self.create_ddl()
 
 
-DEFAULT_STATISTICS_KINDS = ["dependencies", "ndistinct"]
+StatisticsKind = Literal["dependencies", "ndistinct", "mcv"]
+DEFAULT_STATISTICS_KINDS: list[StatisticsKind] = ["dependencies", "ndistinct"]
 
 
 class StatsSuggestion(_TargetSuggestion):
     columns: list[str] = Field(min_length=2)
-    kinds: list[Literal["dependencies", "ndistinct", "mcv"]] = Field(
-        default=["dependencies", "ndistinct"], min_length=1
-    )
+    kinds: list[StatisticsKind] = Field(default=["dependencies", "ndistinct"], min_length=1)
 
     @property
     def suggested_name(self) -> str:
@@ -228,6 +239,7 @@ class VerifyResult(BaseModel):
     equivalent: bool | None = None
     note: str | None = None
     error: str | None = None
+    apply: list[str] = []
 
     @classmethod
     def failed(cls, kind: ChangeKind, statement: str, error: str) -> Self:
@@ -244,11 +256,22 @@ class VerifyResult(BaseModel):
             return None
         return self.before.execution_ms / self.after.execution_ms
 
+    def as_dict(self) -> dict[str, Any]:
+        speedup = self.speedup
+        return {
+            **self.model_dump(mode="json"),
+            "improved": self.improved,
+            "speedup": None if speedup is None else round(speedup, 2),
+            "apply": self.apply if self.improved else [],
+        }
+
     @property
     def improved(self) -> bool:
         if self.error is not None or self.equivalent is False:
             return False
         if self.kind == "index" and not self.after.uses_new_index:
+            return False
+        if self.kind == "statistics" and self.before.node_types == self.after.node_types:
             return False
         speedup = self.speedup
         if speedup is not None and self.before.execution_ms and self.after.execution_ms:
@@ -268,6 +291,8 @@ def ensure_read_only(sql: str) -> None:
         reason = "unterminated quote or comment, or nested comments"
     elif ";" in core:
         reason = "multiple statements are not allowed"
+    elif core.lower().startswith("explain"):
+        reason = "remove the EXPLAIN keyword; pgsage runs EXPLAIN ANALYZE itself"
     elif not READ_ONLY_START.match(core):
         reason = "only SELECT/WITH/VALUES/TABLE statements are allowed"
     elif (found := FORBIDDEN_KEYWORDS.search(core)) or (found := FORBIDDEN_FUNCTIONS.search(core)):
@@ -348,6 +373,10 @@ def _strip(sql: str) -> str:
     return sql.strip().rstrip(";").strip()
 
 
+def _embed(sql: str) -> str:
+    return _strip(sql) + "\n"
+
+
 def top_level(masked: str) -> str:
     depth = 0
     kept: list[str] = []
@@ -376,13 +405,13 @@ def unprovable_reason(sql: str) -> str | None:
 def _columns(
     conn: psycopg.Connection[Any], sql: str
 ) -> list[tuple[str, int, int | None, int | None]]:
-    statement = SQL("SELECT * FROM ({}) AS q LIMIT 0").format(literal(_strip(sql)))
+    statement = SQL("SELECT * FROM ({}) AS q LIMIT 0").format(literal(_embed(sql)))
     cursor = run_single(conn, statement)
     return [(c.name, c.type_code, c.precision, c.scale) for c in cursor.description or []]
 
 
 def _as_text(sql: str) -> Composed:
-    return SQL("SELECT t::text AS r FROM ({}) AS t").format(literal(_strip(sql)))
+    return SQL("SELECT t::text AS r FROM ({}) AS t").format(literal(_embed(sql)))
 
 
 def _results_equivalent(
@@ -422,7 +451,7 @@ def _experiment(
     before_setup: Callable[[psycopg.Connection[Any]], None] | None = None,
 ) -> VerifyResult:
     ensure_runnable(sql)
-    with psycopg.connect(dsn) as conn:
+    with connect(dsn) as conn:
         try:
             begin_guarded(conn)
             if before_setup:
@@ -454,6 +483,40 @@ SELECT c.relname FROM tree JOIN pg_class c ON c.oid = tree.oid
 """
 
 
+def index_apply_sql(suggestion: IndexSuggestion, concurrently: bool = True) -> list[str]:
+    ddl = suggestion.create_ddl(
+        suggestion.suggested_name, if_not_exists=True, concurrently=concurrently
+    )
+    return [f"{ddl};"]
+
+
+def statistics_apply_sql(suggestion: StatsSuggestion) -> list[str]:
+    ddl = suggestion.ddl.replace("CREATE STATISTICS ", "CREATE STATISTICS IF NOT EXISTS ", 1)
+    return [f"{ddl};", f"ANALYZE {suggestion.qualified_table};"]
+
+
+def _failed_on_data_error(
+    kind: ChangeKind, statement: str, run: Callable[[], VerifyResult]
+) -> VerifyResult:
+    try:
+        return run()
+    except psycopg.errors.QueryCanceled:
+        return VerifyResult.failed(kind, statement, TIMEOUT_NOTE)
+    except psycopg.Error as error:
+        if not (error.sqlstate or "").startswith(DATA_ERROR_CLASSES):
+            raise
+        return VerifyResult.failed(kind, statement, describe_error(error))
+
+
+def _is_partitioned(dsn: str, suggestion: IndexSuggestion) -> bool:
+    with connect(dsn) as conn:
+        row = conn.execute(
+            "SELECT relkind FROM pg_class WHERE oid = to_regclass(%s)",
+            (suggestion.qualified_table,),
+        ).fetchone()
+    return bool(row and row[0] == "p")
+
+
 def verify_index(dsn: str, sql: str, suggestion: IndexSuggestion) -> VerifyResult:
     index_name = _unique("pgsage_verify_idx")
 
@@ -461,7 +524,15 @@ def verify_index(dsn: str, sql: str, suggestion: IndexSuggestion) -> VerifyResul
         run_single(conn, literal(suggestion.create_ddl(index_name)))
         return [row[0] for row in conn.execute(FAMILY_SQL, (index_name,)).fetchall()]
 
-    return _experiment(dsn, sql, "index", suggestion.ddl, change)
+    def run() -> VerifyResult:
+        result = _experiment(dsn, sql, "index", suggestion.ddl, change)
+        partitioned = _is_partitioned(dsn, suggestion)
+        update: dict[str, Any] = {"apply": index_apply_sql(suggestion, not partitioned)}
+        if partitioned and result.note is None:
+            update["note"] = PARTITIONED_NOTE
+        return result.model_copy(update=update)
+
+    return _failed_on_data_error("index", suggestion.ddl, run)
 
 
 def verify_statistics(dsn: str, sql: str, suggestion: StatsSuggestion) -> VerifyResult:
@@ -474,16 +545,26 @@ def verify_statistics(dsn: str, sql: str, suggestion: StatsSuggestion) -> Verify
         run_single(conn, literal(suggestion.create_ddl(_unique("pgsage_verify_stats"))))
         run_single(conn, analyze)
 
-    return _experiment(dsn, sql, "statistics", suggestion.ddl, change, before_setup)
+    def run() -> VerifyResult:
+        result = _experiment(dsn, sql, "statistics", suggestion.ddl, change, before_setup)
+        return result.model_copy(update={"apply": statistics_apply_sql(suggestion)})
+
+    return _failed_on_data_error("statistics", suggestion.ddl, run)
 
 
 def verify_rewrite(dsn: str, sql: str, rewritten: str) -> VerifyResult:
     ensure_runnable(sql)
     ensure_runnable(rewritten)
+    return _failed_on_data_error(
+        "rewrite", _strip(rewritten), lambda: _prove_rewrite(dsn, sql, rewritten)
+    )
+
+
+def _prove_rewrite(dsn: str, sql: str, rewritten: str) -> VerifyResult:
     statement = _strip(rewritten)
     if _normalize(sql) == _normalize(rewritten):
         return VerifyResult.failed("rewrite", statement, "the rewrite is identical to the original")
-    with psycopg.connect(dsn) as conn:
+    with connect(dsn) as conn:
         try:
             begin_guarded(conn)
             _lock_read_only(conn)

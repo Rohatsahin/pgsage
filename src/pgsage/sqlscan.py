@@ -33,13 +33,6 @@ def mask(sql: str) -> str:
     return substitute(sql, handler)
 
 
-def redact_condition(text: str) -> str:
-    def handler(kind: str, _: str) -> str:
-        return " " if kind == "comment" else "?" if kind in ("string", "number") else _
-
-    return substitute(text, handler)
-
-
 def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 

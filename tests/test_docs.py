@@ -54,6 +54,9 @@ def test_readme_shows_the_logo_and_it_exists() -> None:
     assert svg.startswith("<svg") and "<title" in svg
 
 
+COMMANDS = ("inspect", "verify", "top", "connections", "init", "install-skill")
+
+
 def test_readme_command_table_matches_the_real_cli() -> None:
     from typer.testing import CliRunner
 
@@ -61,12 +64,22 @@ def test_readme_command_table_matches_the_real_cli() -> None:
 
     help_text = CliRunner().invoke(app, ["--help"]).output
     readme = (ROOT / "README.md").read_text()
-    for command in ("explain", "tune", "verify", "top", "eval"):
+    for command in COMMANDS:
         assert command in help_text
         assert f"`pgsage {command}" in readme
+    for gone in ("tune", "eval", "explain"):
+        assert f"`pgsage {gone}" not in readme
 
 
 def test_documented_mcp_tools_match_the_server() -> None:
+    real = mcp_tool_names()
+    documented = set(re.findall(r"^\| `(\w+)` \|", (ROOT / "docs" / "mcp.md").read_text(), re.M))
+    assert documented == real
+    readme = (ROOT / "README.md").read_text()
+    assert all(name in readme for name in real)
+
+
+def mcp_tool_names() -> set[str]:
     import asyncio
 
     from mcp import Client
@@ -77,8 +90,56 @@ def test_documented_mcp_tools_match_the_server() -> None:
         async with Client(server) as client:
             return {tool.name for tool in (await client.list_tools()).tools}
 
-    real = asyncio.run(names())
-    documented = set(re.findall(r"^\| `(\w+)` \|", (ROOT / "docs" / "mcp.md").read_text(), re.M))
-    assert documented == real
-    readme = (ROOT / "README.md").read_text()
-    assert all(name in readme for name in real)
+    return asyncio.run(names())
+
+
+SKILL = ROOT / "src" / "pgsage" / "skill" / "SKILL.md"
+
+
+def skill_parts() -> tuple[dict[str, str], str]:
+    text = SKILL.read_text(encoding="utf-8")
+    match = re.match(r"---\n(.*?)\n---\n(.*)", text, re.S)
+    assert match, "SKILL.md must start with YAML frontmatter"
+    fields = dict(re.findall(r"^(\w+): (.+)$", match.group(1), re.M))
+    return fields, match.group(2)
+
+
+def test_skill_has_frontmatter_with_a_name_and_a_triggering_description() -> None:
+    fields, _ = skill_parts()
+    assert fields["name"] == "pgsage"
+    assert len(fields["description"]) > 80
+    assert "slow" in fields["description"].lower()
+
+
+def test_skill_mentions_every_mcp_tool_and_every_cli_command() -> None:
+    _, body = skill_parts()
+    for name in mcp_tool_names():
+        assert f"`{name}`" in body, f"SKILL.md does not mention {name}"
+    for command in (
+        "pgsage inspect",
+        "pgsage verify index",
+        "pgsage verify statistics",
+        "pgsage verify rewrite",
+        "pgsage top",
+        "pgsage connections",
+        "pgsage init",
+    ):
+        assert command in body, f"SKILL.md does not mention {command}"
+
+
+def test_skill_tells_the_agent_when_a_change_counts_as_proven() -> None:
+    _, body = skill_parts()
+    assert "improved: true" in body
+    assert "1.1x" in body and "0.5 ms" in body
+
+
+def test_skill_has_no_company_references() -> None:
+    text = SKILL.read_text(encoding="utf-8").lower()
+    for word in ("tempo", "nexus", "flyway"):
+        assert not re.search(rf"\b{word}\b", text)
+
+
+def test_skill_is_packaged_in_the_wheel_layout() -> None:
+    from importlib.resources import files
+
+    assert (files("pgsage") / "skill" / "SKILL.md").is_file()

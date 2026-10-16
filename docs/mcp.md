@@ -1,18 +1,24 @@
-# Using pgsage from an AI agent (MCP)
+# pgsage as an MCP server
 
-The MCP server lets an agent (Claude Code, or any MCP client) run the whole tuning loop itself:
-find a slow query, read its plan and table stats, propose a change, and prove it.
+The MCP server gives an agent (Claude Code, or any MCP client) the same operations as the
+command line: find a slow query, read its plan and table stats, and prove a change. The agent does
+the reasoning; the server does the measuring. See [agents](agents.md) for the full picture.
 
 ## Setup
 
 ```bash
 pip install 'pgsage[mcp]'
-claude mcp add pgsage -e PGSAGE_DSN=postgresql://pgsage:...@scratch-host/db -- pgsage-mcp
+claude mcp add pgsage -e PGSAGE_CONNECTION=scratch -e PGSAGE_SCRATCH_PASSWORD -- pgsage-mcp
 ```
 
-`PGSAGE_DSN` is the only way to choose the database. No tool accepts a connection string, so a
-prompt-injected agent cannot redirect pgsage to another host or reuse your credentials. Use a
-dev or scratch database and a least-privilege role (see [security](security.md)).
+The server's own environment chooses the database: `PGSAGE_CONNECTION` (a name from your
+`pgsage.toml` or user config), `PGSAGE_DSN`, or the `PG*` variables. A `protected` connection is
+refused by the tools that run proofs. No tool accepts a connection string, so a prompt-injected
+agent cannot redirect pgsage to another host or reuse your credentials. Use a dev or scratch
+database and a least-privilege role (see [security](security.md)).
+
+The skill (`pgsage install-skill`) is a good companion: the server tells the agent what the tools
+do, and the skill tells it how to read a plan and what is safe to propose.
 
 ## Tools
 
@@ -20,14 +26,16 @@ dev or scratch database and a least-privilege role (see [security](security.md))
 | --- | --- | --- |
 | `get_top_queries` | `limit` | costliest `SELECT`s from `pg_stat_statements` (values appear as `$n`) |
 | `get_query_plan` | `sql` | the per-node digest and the raw plan from a read-only `EXPLAIN ANALYZE` |
-| `summarize_plan` | `plan_json` | the digest for `EXPLAIN` JSON you already have |
+| `summarize_plan` | `plan_json` | the digest for `EXPLAIN` JSON you already have (no database needed) |
 | `get_table_info` | `table`, `schema` | columns, indexes, size, `n_distinct`, `null_frac`, `correlation` |
-| `verify_index_suggestion` | `sql`, `table`, `columns`, `schema`, `method`, `include`, `where` | before and after plans, `uses_new_index`, `improved` |
+| `verify_index_suggestion` | `sql`, `table`, `columns`, `schema`, `method`, `include`, `where` | before and after plans, `uses_new_index`, `improved`, `speedup`, `apply` |
+| `verify_statistics_suggestion` | `sql`, `table`, `columns`, `kinds`, `schema` | before and after plans for `CREATE STATISTICS` + `ANALYZE`, `improved`, `apply` |
 | `verify_query_rewrite` | `sql`, `rewritten_sql` | equivalence verdict, before and after, `improved` |
 
 `verify_*` roll everything back. `improved` is true only for a measured speedup (at least 1.1x
 and at least 0.5 ms), with the new index actually used (indexes) and identical results
-(rewrites). When no timings exist, a lower plan cost counts instead.
+(rewrites; on the database's current data), and, for statistics, a changed plan. For a proven index or
+statistics change, `apply` holds idempotent SQL.
 
 ## A typical loop
 
@@ -35,14 +43,11 @@ and at least 0.5 ms), with the new index actually used (indexes) and identical r
 2. `get_query_plan`: look at the largest `self_ms`, at `estimate_off_by`, and at
    `rows_removed_by_filter` (a total across loops, like `actual_rows_total`).
 3. `get_table_info` for each table in the plan: existing indexes and column statistics.
-4. Propose one change, then `verify_index_suggestion` or `verify_query_rewrite`.
+4. Propose one change, then `verify_index_suggestion`, `verify_statistics_suggestion` or
+   `verify_query_rewrite`.
 5. If `improved` is false, read `note`, `error` and `uses_new_index`, then try something different.
    Do not resubmit the same idea.
 6. Report only changes with `improved: true`.
-
-Guidance for agents on *how* to analyse a plan lives in
-[`src/pgsage/prompts/system.md`](../src/pgsage/prompts/system.md); it is written for the CLI's own
-model but applies equally to an agent driving these tools.
 
 ## Notes
 

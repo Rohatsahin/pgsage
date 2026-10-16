@@ -16,8 +16,10 @@ from pgsage.verify import (
     UnsafeStatementError,
     VerifyResult,
     begin_guarded,
+    index_apply_sql,
     measure,
     measure_interleaved,
+    statistics_apply_sql,
     unprovable_reason,
     verify_index,
     verify_rewrite,
@@ -227,12 +229,12 @@ def test_a_limit_with_only_a_window_order_by_is_unprovable(pg_dsn: str, eq: None
 def test_column_name_injection_cannot_commit_or_drop(
     pg_dsn: str, pg_conn: psycopg.Connection, victim: None
 ) -> None:
-    with pytest.raises(psycopg.Error):
-        verify_index(
-            pg_dsn,
-            "SELECT * FROM orders WHERE id = 5",
-            IndexSuggestion(table="orders", columns=[INJECTION]),
-        )
+    result = verify_index(
+        pg_dsn,
+        "SELECT * FROM orders WHERE id = 5",
+        IndexSuggestion(table="orders", columns=[INJECTION]),
+    )
+    assert not result.improved and result.error
     assert exists(pg_conn, "victim")
     assert leaked_verify_objects(pg_conn) == 0
 
@@ -240,12 +242,12 @@ def test_column_name_injection_cannot_commit_or_drop(
 def test_table_name_injection_cannot_commit_or_drop(
     pg_dsn: str, pg_conn: psycopg.Connection, victim: None
 ) -> None:
-    with pytest.raises(psycopg.Error):
-        verify_index(
-            pg_dsn,
-            "SELECT * FROM orders WHERE id = 5",
-            IndexSuggestion(table='orders"; COMMIT; DROP TABLE victim; --', columns=["id"]),
-        )
+    result = verify_index(
+        pg_dsn,
+        "SELECT * FROM orders WHERE id = 5",
+        IndexSuggestion(table='orders"; COMMIT; DROP TABLE victim; --', columns=["id"]),
+    )
+    assert not result.improved and result.error
     assert exists(pg_conn, "victim")
 
 
@@ -577,3 +579,156 @@ def test_index_names_are_distinct_per_variant() -> None:
 def test_unsafe_or_unsupported_index_options_are_rejected(bad: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         IndexSuggestion.model_validate({"table": "t", "columns": ["a"], **bad})
+
+
+def timed(ms: float, nodes: list[str], uses_index: bool = False) -> PlanSummary:
+    return PlanSummary(
+        total_cost=100.0, execution_ms=ms, node_types=nodes, uses_new_index=uses_index
+    )
+
+
+def proven_index_result(suggestion: IndexSuggestion) -> VerifyResult:
+    return VerifyResult(
+        kind="index",
+        statement=suggestion.ddl,
+        before=timed(14.0, ["Seq Scan"]),
+        after=timed(1.0, ["Index Scan"], True),
+        apply=index_apply_sql(suggestion),
+    )
+
+
+def test_apply_sql_is_idempotent_and_builds_indexes_concurrently() -> None:
+    suggestion = IndexSuggestion(table="orders", columns=["customer_id"])
+    assert index_apply_sql(suggestion) == [
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_orders_customer_id" '
+        'ON "orders" ("customer_id");'
+    ]
+
+
+def test_apply_sql_can_avoid_concurrently() -> None:
+    suggestion = IndexSuggestion(table="orders", columns=["customer_id"])
+    (statement,) = index_apply_sql(suggestion, concurrently=False)
+    assert "CONCURRENTLY" not in statement
+    assert statement.startswith('CREATE INDEX IF NOT EXISTS "idx_orders_customer_id"')
+
+
+def test_statistics_apply_sql_is_idempotent_and_followed_by_analyze() -> None:
+    suggestion = StatsSuggestion(table="orders", columns=["a", "b"])
+    statements = statistics_apply_sql(suggestion)
+    assert statements[0].startswith('CREATE STATISTICS IF NOT EXISTS "stats_orders_a_b"')
+    assert statements[1] == 'ANALYZE "orders";'
+
+
+def test_partial_and_covering_indexes_keep_their_shape_in_the_apply_sql() -> None:
+    suggestion = IndexSuggestion(
+        table="orders", columns=["customer_id"], where="status = 'open'", include=["created_at"]
+    )
+    (statement,) = index_apply_sql(suggestion)
+    assert statement.endswith("""INCLUDE ("created_at") WHERE status = 'open';""")
+
+
+def test_identifier_quotes_are_escaped_in_the_apply_sql() -> None:
+    suggestion = IndexSuggestion(table="t", columns=['x"); DROP TABLE v; --'])
+    (statement,) = index_apply_sql(suggestion)
+    assert '"x""); DROP TABLE v; --"' in statement
+
+
+def test_as_dict_offers_the_apply_sql_only_for_a_proven_change() -> None:
+    suggestion = IndexSuggestion(table="orders", columns=["customer_id"])
+    proven = proven_index_result(suggestion)
+    assert proven.as_dict()["improved"] is True
+    assert proven.as_dict()["speedup"] == 14.0
+    assert proven.as_dict()["apply"] == index_apply_sql(suggestion)
+    unproven = proven.model_copy(update={"after": timed(14.0, ["Seq Scan"])})
+    assert unproven.as_dict()["improved"] is False
+    assert unproven.as_dict()["apply"] == []
+
+
+def test_a_failed_result_has_no_speedup_and_nothing_to_apply() -> None:
+    failed = VerifyResult.failed("index", "CREATE INDEX ON t (a)", "boom")
+    assert failed.as_dict()["speedup"] is None
+    assert failed.as_dict()["apply"] == []
+
+
+def test_verify_index_returns_the_apply_sql(pg_dsn: str) -> None:
+    suggestion = IndexSuggestion(table="orders", columns=["customer_id"])
+    result = verify_index(pg_dsn, "SELECT * FROM orders WHERE customer_id = 7", suggestion)
+    assert result.improved
+    assert result.as_dict()["apply"] == index_apply_sql(suggestion)
+
+
+def test_verify_statistics_returns_the_apply_sql(pg_dsn: str, eq: None) -> None:
+    suggestion = StatsSuggestion(table="eq", columns=["id", "grp"])
+    result = verify_statistics(pg_dsn, "SELECT * FROM eq WHERE id = 1 AND grp = 1", suggestion)
+    assert result.apply == statistics_apply_sql(suggestion)
+
+
+def test_a_rewrite_has_nothing_to_apply(pg_dsn: str) -> None:
+    result = verify_rewrite(
+        pg_dsn,
+        "SELECT * FROM orders WHERE customer_id = 7",
+        "SELECT * FROM orders WHERE customer_id = 7 AND true",
+    )
+    assert result.apply == []
+
+
+def plan_shape(nodes: list[str], ms: float) -> Any:
+    return verify_module.PlanSummary(total_cost=1.0, execution_ms=ms, node_types=nodes)
+
+
+def test_a_statistics_proof_needs_a_changed_plan() -> None:
+    same = verify_module.VerifyResult(
+        kind="statistics",
+        statement="CREATE STATISTICS s ON a, b FROM t",
+        before=plan_shape(["Seq Scan"], 10.0),
+        after=plan_shape(["Seq Scan"], 5.0),
+    )
+    changed = same.model_copy(update={"after": plan_shape(["Index Scan"], 5.0)})
+    assert not same.improved
+    assert changed.improved
+
+
+def test_index_names_stay_within_the_identifier_limit_for_multibyte_names() -> None:
+    suggestion = IndexSuggestion(table="é" * 40, columns=["ü" * 40, "plain"])
+    assert len(suggestion.suggested_name.encode()) <= 63
+
+
+def test_an_index_on_a_partitioned_table_is_applied_without_concurrently(
+    pg_dsn: str, pg_conn: psycopg.Connection
+) -> None:
+    pg_conn.execute("CREATE TABLE parted (id int, d date) PARTITION BY RANGE (d)")
+    pg_conn.execute(
+        "CREATE TABLE parted_1 PARTITION OF parted FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')"
+    )
+    try:
+        result = verify_index(
+            pg_dsn,
+            "SELECT * FROM parted WHERE id = 5",
+            IndexSuggestion(table="parted", columns=["id"]),
+        )
+    finally:
+        pg_conn.execute("DROP TABLE parted")
+    assert result.apply == ['CREATE INDEX IF NOT EXISTS "idx_parted_id" ON "parted" ("id");']
+    assert result.note is not None and "partitioned" in result.note
+
+
+def test_a_trailing_line_comment_does_not_break_a_rewrite_proof(pg_dsn: str) -> None:
+    result = verify_rewrite(
+        pg_dsn,
+        "SELECT id FROM orders WHERE id < 5 ORDER BY id -- newest first",
+        "SELECT id FROM orders WHERE id < 5 ORDER BY id, customer_id",
+    )
+    assert result.error is None
+    assert result.equivalent is True
+
+
+def test_a_statement_timeout_is_an_unproven_result_not_a_crash(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def cancelled(*args: object, **kwargs: object) -> None:
+        raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(verify_module, "_prove_rewrite", cancelled)
+    result = verify_rewrite(pg_dsn, "SELECT 1 AS a", "SELECT 2 AS a")
+    assert not result.improved
+    assert result.error is not None and "timed out" in result.error

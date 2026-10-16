@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -133,13 +134,35 @@ async def test_an_agent_is_told_why_a_call_failed() -> None:
 
 @pytest.mark.anyio
 async def test_database_errors_reach_the_agent_with_their_type() -> None:
-    text = await error_text(
-        "verify_index_suggestion", {"sql": QUERY, "table": "orders", "columns": ["no_such_column"]}
-    )
-    assert "UndefinedColumn" in text
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "verify_index_suggestion",
+            {"sql": QUERY, "table": "orders", "columns": ["no_such_column"]},
+        )
+    assert not result.is_error
+    first = result.content[0]
+    assert isinstance(first, TextContent)
+    verdict = json.loads(first.text)
+    assert verdict["improved"] is False
+    assert "UndefinedColumn" in verdict["error"]
 
 
 @pytest.mark.anyio
 async def test_a_missing_dsn_says_what_to_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PGSAGE_DSN")
     assert "PGSAGE_DSN" in await error_text("get_query_plan", {"sql": QUERY})
+
+
+@pytest.mark.anyio
+async def test_a_protected_connection_refuses_the_tools_that_run_ddl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "pgsage.toml").write_text('[connections.prod]\nhost = "h"\nprotected = true\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PGSAGE_DSN")
+    monkeypatch.setenv("PGSAGE_CONNECTION", "prod")
+    for tool, arguments in (
+        ("verify_index_suggestion", {"sql": QUERY, "table": "orders", "columns": ["customer_id"]}),
+        ("verify_query_rewrite", {"sql": QUERY, "rewritten_sql": QUERY + " "}),
+    ):
+        assert "protected" in await error_text(tool, arguments)

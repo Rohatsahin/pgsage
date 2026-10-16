@@ -6,7 +6,7 @@ import pytest
 
 from pgsage import verify as verify_module
 from pgsage.context import get_plan
-from pgsage.sqlscan import is_ambiguous, mask, redact_condition
+from pgsage.sqlscan import is_ambiguous, mask
 from pgsage.verify import (
     UnsafeStatementError,
     ensure_read_only,
@@ -103,8 +103,8 @@ def test_even_with_the_sql_gate_disabled_a_smuggled_statement_cannot_run(
     monkeypatch.setattr(verify_module, "ensure_read_only", allow_everything)
     with pytest.raises(psycopg.Error):
         get_plan(pg_dsn, "SELECT 1 /* x */; DROP TABLE victim")
-    with pytest.raises(psycopg.Error):
-        verify_rewrite(pg_dsn, "SELECT 1 AS a", "SELECT 1 AS a /* x */; DROP TABLE victim")
+    result = verify_rewrite(pg_dsn, "SELECT 1 AS a", "SELECT 1 AS a /* x */; DROP TABLE victim")
+    assert result.error and not result.improved
     assert exists(pg_conn, "victim")
 
 
@@ -177,23 +177,6 @@ def test_mask_hides_literals_and_comments_but_not_structure() -> None:
     assert mask("SELECT 'a;b', \"c;d\" FROM t -- x;y\nWHERE n = 5") == (
         "SELECT '', \"\" FROM t  \nWHERE n = 5"
     )
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("(a = 'x'::text)", "(a = ?::text)"),
-        ("(a = $$secret$$)", "(a = ?)"),
-        ("(a = $tag$se'cret$tag$)", "(a = ?)"),
-        ("(a = E'it\\'s secret')", "(a = ?)"),
-        ("(a > 1e5) AND (b < 1.5e-3)", "(a > ?) AND (b < ?)"),
-        ("(a = 5) -- it's secret", "(a = ?)  "),
-        ("(col1 = 2)", "(col1 = ?)"),
-        ("(name = 'O''Brien') AND (x > -1.5)", "(name = ?) AND (x > ?)"),
-    ],
-)
-def test_redact_condition(text: str, expected: str) -> None:
-    assert redact_condition(text) == expected
 
 
 @pytest.mark.parametrize(

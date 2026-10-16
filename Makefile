@@ -1,4 +1,4 @@
-.PHONY: help install check test lint fmt types eval
+.PHONY: help install check test lint fmt types
 
 help:
 	@echo "make install  📦 sync dependencies (all extras)"

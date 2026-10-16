@@ -5,8 +5,8 @@
 <h1 align="center">pgsage</h1>
 
 <p align="center">
-  <strong>An LLM proposes. Postgres proves.</strong><br>
-  AI-native PostgreSQL query tuning where every suggestion is measured on a real database before you see it.
+  <strong>Your agent proposes. Postgres proves.</strong><br>
+  Paste a slow query to your AI coding agent. pgsage gives it the plan facts and measures every fix on a real database before the agent tells you about it.
 </p>
 
 <p align="center">
@@ -22,180 +22,205 @@
 ## Why
 
 Asking an AI "why is this query slow?" gives you confident prose that is often wrong: indexes the
-planner ignores, rewrites that quietly change the results, advice that does nothing. pgsage keeps
-the model for what it is good at (reading a plan, spotting the bottleneck, proposing a fix) and
-hands the verdict to PostgreSQL.
+planner ignores, rewrites that quietly change the results, advice that does nothing. Your agent
+is good at reading a plan and proposing a fix. It cannot tell whether the fix works. pgsage can:
+it applies each proposal inside a transaction that is rolled back (statistics proofs aside, see below), times the query before and
+after, and returns a verdict.
 
 ```text
-plan + table stats ─► LLM proposes ─► allow-list ─► apply in a rolled-back transaction ─► measure
-        ▲                index / statistics / rewrite                                     │
-        └──────────────── what failed, and why, goes back to the model ◄─────────────────┘
+you paste a slow query
+        │
+        ▼
+ your agent ──► pgsage inspect ──► plan digest + table facts
+        │
+        ├──────► pgsage verify ──► apply in a rolled-back transaction, measure ──► proven or not
+        │             ▲                                                              │
+        └─────────────┴──────── the agent reads the verdict and tries something else ┘
 ```
 
-- 🧪 **Proven, not claimed.** Changes are applied inside a transaction that is rolled back and
-  timed (best of 3) before and after. No speedup, no report.
+- 🧪 **Proven, not claimed.** Best of three timed runs before and after. No measured speedup, no
+  recommendation.
+- 🤖 **Built for agents.** An MCP server and a thin command line that prints JSON, plus a skill
+  that teaches the agent how to read a plan and what is safe to propose.
+- 🧠 **No model inside.** pgsage never calls an LLM and needs no API key. Your agent is the model.
 - 🔒 **Safe by construction.** One read-only statement, read-only transactions for every
-  measurement, quoted identifiers, timeouts, and an allow-list on what the model may touch.
-- 🛡️ **Prompt-injection aware.** Unusual table and column names (spaces, `;`, instruction-like
-  text) are aliased before the model sees them, and literals are redacted and restored locally;
-  see the security doc for what plain-looking names mean.
-- 🤖 **Agent-ready.** An MCP server lets Claude Code or any agent run the whole loop.
-- 📝 **Readable prompt.** The system prompt is a markdown file you can read and change:
-  [`system.md`](src/pgsage/prompts/system.md).
-- 🔌 **Any model.** Claude by default (structured output, prompt caching, effort control), or any
-  OpenAI-compatible server such as Ollama or vLLM.
+  measurement, quoted identifiers, timeouts, and a `protected` flag for databases it must never
+  touch.
 
 ## Quick start
 
 ```bash
-pip install 'pgsage[anthropic]'
-export ANTHROPIC_API_KEY=...
+pip install 'pgsage[mcp]'
 
-pgsage tune --dsn postgresql://user:pw@scratch-host/db \
-            --sql "SELECT * FROM orders WHERE customer_id = 7"
+pgsage init                     # writes a starter pgsage.toml; edit the connection
+pgsage connections test         # check you can reach it
+
+pgsage install-skill            # teach your agent (Claude Code: .claude/skills/pgsage)
+claude mcp add pgsage -e PGSAGE_CONNECTION=scratch -e PGSAGE_SCRATCH_PASSWORD -- pgsage-mcp   # optional: MCP tools
 ```
 
-Use a **scratch or dev database**: tuning runs `EXPLAIN ANALYZE`, which executes the query.
+Then paste a slow query to your agent and ask why it is slow. Use a **scratch or dev database**:
+the tools run `EXPLAIN ANALYZE`, which executes the query.
 
-### Large queries
+The skill and the MCP server do the same job; use either or both. An agent with only a shell
+uses the commands directly, which is how the transcript below was produced.
 
-You do not have to squeeze a query into a quoted string:
+### Shell or MCP
+
+An agent with a shell calls the `pgsage` commands below. An agent with MCP gets seven tools that
+do the same work: `get_top_queries`, `get_query_plan`, `summarize_plan`, `get_table_info`,
+`verify_index_suggestion`, `verify_statistics_suggestion` and `verify_query_rewrite`. The database
+is fixed in the server's environment; no tool accepts a connection string. Details:
+[docs/agents.md](docs/agents.md) and [docs/mcp.md](docs/mcp.md).
+
+### What the agent sees
+
+You: *"This is slow, can you fix it?"*
+`SELECT * FROM orders WHERE customer_id = 7 AND status = 'status2'`
+
+The agent runs `pgsage inspect` and gets the plan digest and table facts as JSON (shortened):
+
+```json
+{
+  "query": "SELECT * FROM orders WHERE customer_id = 7 AND status = 'status2'",
+  "baseline_ms": 19.569,
+  "digest": [
+    {"depth": 0, "node": "Gather", "self_ms": 3.656, "estimate_off_by": 5.0},
+    {"depth": 1, "node": "Seq Scan", "relation": "orders", "actual_rows_total": 300.0,
+     "rows_removed_by_filter": 299700.0, "self_ms": 15.834, "estimate_off_by": 4.3}
+  ],
+  "tables": [
+    {"table": "public.orders", "indexes": [], "size": {"estimated_rows": 300000},
+     "column_stats": [{"column_name": "customer_id", "n_distinct": 1000.0}]}
+  ]
+}
+```
+
+The Seq Scan reads 300,000 rows and throws away 299,700, and `orders` has no index. The agent
+proposes one and proves it with `pgsage verify index --table orders --columns customer_id,status`:
+
+```json
+{
+  "kind": "index",
+  "statement": "CREATE INDEX ON \"orders\" (\"customer_id\", \"status\")",
+  "before": {"execution_ms": 7.713, "node_types": ["Gather", "Seq Scan"], "uses_new_index": false},
+  "after": {"execution_ms": 0.112, "node_types": ["Bitmap Heap Scan", "Bitmap Index Scan"],
+            "uses_new_index": true},
+  "apply": ["CREATE INDEX CONCURRENTLY IF NOT EXISTS \"idx_orders_customer_id_status\" ON \"orders\" (\"customer_id\", \"status\");"],
+  "improved": true,
+  "speedup": 68.87
+}
+```
+
+Agent: *"`orders` is scanned in full and almost every row is discarded. An index on
+`(customer_id, status)` cut the query from 7.7 ms to 0.1 ms in a measured, rolled-back trial.
+To apply it: `CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`. It will also add cost to every write
+on `orders`."*
+
+That output is from a real run on a 300,000-row table; timings vary with your machine and data.
+A change that does not help comes back with `"improved": false` and the reason, and the agent
+tries something else.
+
+### Connections
+
+Name your databases once instead of pasting connection strings. `pgsage.toml` (found by walking
+up from the current directory, so it can live in the repo) and `~/.config/pgsage/config.toml`
+(yours alone) both work; the project file overrides yours by name.
+
+```toml
+default_connection = "scratch"
+
+[connections.scratch]
+host = "localhost"
+dbname = "app"
+user = "app"
+password_env = "PGSAGE_SCRATCH_PASSWORD"
+
+[connections.ci]
+dsn = "${PGSAGE_DATABASE_URL}"
+
+[connections.staging-clone]
+service = "staging_clone"
+protected = true
+```
 
 ```bash
-pgsage tune --dsn ... --file slow_query.sql        # from a file
-cat slow_query.sql | pgsage tune --dsn ...         # from stdin (or: --file -)
-pgsage tune --dsn ... --edit                       # write it in your $EDITOR
-pgsage tune --dsn ...                              # in a terminal with no source: opens $EDITOR
-pgsage tune --dsn ... --file q.sql --dry-run       # size of the prompt, no model call
-pgsage tune --dsn ... --file q.sql --show-prompt   # the exact prompt that would be sent
+pgsage inspect -c staging-clone --file q.sql   # -c / --connection picks a name
+pgsage connections                             # list names, targets and where they come from
 ```
 
-For example, with `slow_query.sql` holding a small multi-line query against a 300k-row table
-(real output):
+The database is chosen in this order: `--dsn` (or `PGSAGE_DSN`), `--connection` (or
+`PGSAGE_CONNECTION`), `default_connection`, then the standard `PGHOST`, `PGSERVICE` and friends,
+so `~/.pg_service.conf` and `~/.pgpass` work as usual.
 
-```text
-$ pgsage tune --dsn postgresql://... --file slow_query.sql --dry-run
-Prompt built; nothing was sent to a model.
-  system prompt: 16,317 characters (static, cached)
-  query, plan and tables: 3,265 characters (cached across rounds)
-  about 4,931 tokens in total (estimate: 1 token per 4 characters)
-  plan: 2 nodes, sent in full; tables: 1
-```
-
-`--show-prompt` prints the same summary and then the exact prompt, which starts like this
-(literals are already tokens such as `__L1__`, and the boundary token changes every run):
-
-```text
---- prompt (after the system prompt) ---
-Boundary token: 22f4cdeb5c045dc8
-UNTRUSTED INPUT BEGINS [22f4cdeb5c045dc8]
-{"plan":{"Plan":{"Node Type":"Gather","Startup Cost":1000.0, ...
-```
-
-Giving two sources at once is refused:
-
-```text
-$ pgsage tune --dsn ... --sql "SELECT 1" --file slow_query.sql
-error: use only one of --sql, --file and --edit
-```
-
-`verify` takes the same `--sql`, `--file` and `--edit`. The prompt is built to stay small as the
-query grows: JSON is sent compact (indentation scales with plan depth), the query is
-whitespace-normalized, and a plan with more than 60 nodes sends a per-node digest plus the full
-detail of the 8 costliest nodes instead of the whole tree. On a synthetic left-deep 100-join plan
-this took the prompt from about 240,000 tokens to about 8,000. A query over 100,000 characters
-is refused with a clear message, never silently truncated.
-
-`pgsage verify` shows what a proof looks like (a real run on a 300k-row table):
-
-```text
-[PROVEN] index: CREATE INDEX ON "orders" ("customer_id")
-    cost 4845.9 -> 1417.6, 14.095 ms -> 1.165 ms, 12.1x faster
-```
-
-And `pgsage eval --oracle` runs the built-in cases with known-good answers:
-
-```text
-PASS  missing-index: proven index: CREATE INDEX ON "ev_orders" ("customer_id") (47.9x)
-PASS  composite-index: proven index: CREATE INDEX ON "ev_orders" ("customer_id", "status") (42.5x)
-PASS  date-cast-rewrite: proven rewrite: SELECT * FROM ev_events WHERE created_at >= ... (54.4x)
-PASS  primary-key-lookup: no changes proposed
-PASS  full-table-aggregate: no changes proposed
-```
+- **No passwords in files.** A `password` key is rejected. Use `password_env`, `${VAR}` inside a
+  `dsn`, a `.pgpass` file, or `password_command = ["op", "read", "op://vault/db/password"]`.
+  `password_command` runs a program (no shell), so it is only honored in your own user config,
+  never in a project file you may have just cloned. For the same reason a project file may only
+  read environment variables that start with `PGSAGE_`, and it cannot redefine a connection your
+  user config already defines.
+- **`protected = true`** marks a database where pgsage must never create indexes or run your
+  query to prove a change. The `verify` commands and tools refuse it; `inspect` and `top` still
+  work, and `inspect` does run the query (`EXPLAIN ANALYZE`). Only named connections can be
+  protected: a `--dsn`, `PGSAGE_DSN` or the `PG*` variables are never.
+- Behind a bastion? Open the tunnel yourself (`ssh -L 5433:db:5432 bastion`) and point `host` and
+  `port` at it. pgsage does not manage tunnels.
+- A password in `--dsn` shows up in `ps`; prefer a named connection.
 
 ## Commands
 
+Every command prints one JSON document on stdout; messages go to stderr; failures print
+`error: ...` and exit 2.
+
 | Command | What it does |
 | --- | --- |
-| `pgsage tune` | fetch plan and table stats, ask the model, prove each proposal, retry with feedback; the query comes from `--sql`, `--file`, `--edit` or stdin |
-| `pgsage tune --dry-run` / `--show-prompt` | build the prompt, print its size (or the whole prompt), call no model |
-| `pgsage tune --report-dir reports/` | also write a Markdown report, a JSON report and a plain SQL script of the proven changes (any migration tool, or `psql -f`) |
-| `pgsage explain [plan.json]` | explain an `EXPLAIN (ANALYZE, FORMAT JSON)` you already have, no database needed; the advice is **unverified**, use `tune` to prove it |
-| `pgsage verify` | prove one index you chose yourself |
-| `pgsage top` | the costliest `SELECT`s from `pg_stat_statements` |
-| `pgsage eval` | score a model on cases with known fixes (`--oracle` validates the harness, no LLM) |
+| `pgsage inspect` | plan digest, baseline time and table facts for a `SELECT` (`--raw-plan` adds the raw plan) |
+| `pgsage verify index` | prove an index (`--method`, `--include`, `--where`); exit 1 if not proven |
+| `pgsage verify statistics` | prove extended statistics (`--kinds`); exit 1 if not proven |
+| `pgsage verify rewrite` | prove a rewritten `SELECT` returns the same rows, faster (`--rewrite` or `--rewrite-file`); exit 1 if not proven |
+| `pgsage top` | the costliest `SELECT`s from `pg_stat_statements` (values appear as `$n`) |
+| `pgsage connections` / `connections test` | list named connections; connect and report who and what you reached |
+| `pgsage init` | write a starter `pgsage.toml` (never overwrites) |
+| `pgsage install-skill` | install the skill for your agent (`--user` for every project, `--dir` for another agent) |
 
-Options for the model: `--provider anthropic|openai`, `--model`, `--effort low..max`,
-`--base-url` (for OpenAI-compatible servers), `--rounds`.
-
-## The report
-
-`pgsage tune --report-dir reports/` writes three tool-neutral files per run (timestamped, never
-overwriting an earlier run):
-
-| File | For | Contains |
-| --- | --- | --- |
-| `pgsage-<time>.md` | people | the query, baseline and hotspots, the diagnosis with evidence, a results table, each proven change with its measured before and after, what was not proven and why, and caveats |
-| `pgsage-<time>.json` | tools and CI | the same data, versioned (`schema_version`), including per-change `proven`, `speedup`, `sql` and `error` |
-| `pgsage-<time>.sql` | applying | only the proven DDL, idempotent (`IF NOT EXISTS`), indexes built `CONCURRENTLY` (`--no-concurrently` to turn that off); paste into any migration tool or run `psql -f` |
-
-Rewrites appear in the report with their equivalence verdict but not in the SQL script, since
-they belong in your application code. The report never contains connection details, and model
-written text is escaped before it goes into the Markdown.
-
-## Use it from an AI agent
-
-```bash
-pip install 'pgsage[mcp]'
-claude mcp add pgsage -e PGSAGE_DSN=postgresql://pgsage:...@scratch-host/db -- pgsage-mcp
-```
-
-Six tools (`get_top_queries`, `get_query_plan`, `get_table_info`, `summarize_plan`,
-`verify_index_suggestion`, `verify_query_rewrite`). The DSN is fixed in the server's environment;
-no tool accepts one. Details: [docs/mcp.md](docs/mcp.md).
+The query comes from `--sql`, `--file` (`-` for stdin) or piped stdin; nothing ever prompts.
+Every database command takes `-c/--connection NAME` or `--dsn`.
 
 ## What "proven" means
 
 | Change | Proven when |
 | --- | --- |
-| index (btree, partial, covering, gin, brin, hash) | the new plan uses it, is at least 1.1x faster and at least 0.5 ms faster (partitioned parents work) |
+| index (btree, partial, covering, gin, brin, hash) | the new plan uses it and is at least 1.1x and 0.5 ms faster (partitioned parents work) |
 | rewrite | same column names, types and precision, same rows (in order if there is a top-level `ORDER BY`), and faster in interleaved runs; a rewrite identical to the original is not a proof |
 | extended statistics | at least 1.1x and 0.5 ms faster, with `ANALYZE` run on both sides |
 
 Rewrites that cannot be compared (volatile functions, `LIMIT` without `ORDER BY`) are never
-proven. A proposal that fails on the database is reported as not proven, with the error fed back
-to the model. Verification measures reads only; it does not measure the write cost of a new index.
+proven. A proposal that fails on the database comes back as not proven with the error, so the
+agent can correct it. Verification measures reads only; it does not measure the write cost of a
+new index. For a proven change, `apply` holds idempotent SQL (indexes use `CONCURRENTLY`, which
+must run outside a transaction block).
 
 ## Safety, briefly
 
 The real boundary is the database role: **use a least-privilege role on a scratch database.**
 On top of that, pgsage accepts one read-only statement, runs every measurement in a read-only
 transaction with timeouts, quotes all identifiers, has PostgreSQL itself refuse any second
-statement, aliases unusual names before they reach the model, and rejects any proposal that
-targets something outside the query. What it does and does
-not protect against: [docs/security.md](docs/security.md).
+statement, and never takes a connection string from a tool call. Your agent sees what the tools
+return: names, plan conditions, literals and error text from your database. What pgsage does and
+does not protect against: [docs/security.md](docs/security.md).
 
 ## Documentation
 
 | | |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | data flow, the proof, modules, prompt layout and caching |
-| [docs/security.md](docs/security.md) | threat model, what is sent to the LLM, residual risks, role setup |
-| [docs/mcp.md](docs/mcp.md) | agent setup, tools, a typical loop |
-| [src/pgsage/prompts/system.md](src/pgsage/prompts/system.md) | the system prompt, with worked examples |
+| [docs/agents.md](docs/agents.md) | using pgsage from an AI agent: MCP or shell, the loop, the JSON contract, exit codes |
+| [docs/mcp.md](docs/mcp.md) | MCP setup and tools |
+| [docs/architecture.md](docs/architecture.md) | data flow, the proof, modules |
+| [docs/security.md](docs/security.md) | threat model, residual risks, role setup |
+| [src/pgsage/skill/SKILL.md](src/pgsage/skill/SKILL.md) | the skill: how an agent reads a plan and what it may propose |
 | [SECURITY.md](SECURITY.md) | how to report a vulnerability, and what counts |
 | [AGENTS.md](AGENTS.md) | conventions and hard invariants for AI coding agents and contributors |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | how to contribute and report a vulnerability |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | how to contribute |
 
 ## Development
 
@@ -204,8 +229,8 @@ make install     # 📦 uv sync --all-extras
 make check       # ✅ ruff + format + pyright (strict) + pytest, with an emoji summary
 ```
 
-Tests start a real `postgres:17` through Docker; the LLM is always faked, so no API key is needed.
-CI runs the same checks on Python 3.12 and 3.13 and publishes a job summary with per-file results
+Tests start a real `postgres:17` through Docker; no model and no API key are involved.
+CI runs the same checks on Python 3.12, 3.13 and 3.14 and publishes a job summary with per-file results
 and the slowest tests.
 
 ## License

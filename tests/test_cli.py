@@ -1,351 +1,45 @@
 import io
 import json
+import stat
 import sys
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-import psycopg
 import pytest
 from typer.testing import CliRunner
 
-from pgsage import cli
-from pgsage.ai import ExplanationError
 from pgsage.cli import MAX_QUERY_BYTES, app, read_query
-from pgsage.cli import make_client as real_make_client
-from pgsage.verify import literal
-from tests.fakes import FakeClient, use_client
 
-PLAN = [
-    {
-        "Plan": {
-            "Node Type": "Seq Scan",
-            "Relation Name": "orders",
-            "Filter": "(customer_id = 7)",
-            "Startup Cost": 0.0,
-            "Total Cost": 10.0,
-            "Plan Rows": 2000,
-            "Actual Rows": 2000,
-            "Actual Loops": 1,
-            "Actual Total Time": 20.0,
-            "Rows Removed by Filter": 198000,
-        },
-        "Execution Time": 20.0,
-    }
-]
-
-
-REPLY = json.dumps(
-    {
-        "summary": "Seq scan dominates",
-        "root_cause": "Missing index",
-        "actions": [
-            {
-                "description": "Add index",
-                "sql": None,
-                "index": {"table": "orders", "columns": ["customer_id"]},
-            }
-        ],
-    }
-)
-
+QUERY = "SELECT *\nFROM orders\nWHERE customer_id = 7"
 
 runner = CliRunner()
 
 
-@pytest.fixture(autouse=True)
-def fake_llm(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
-    client = FakeClient(REPLY)
-    use_client(monkeypatch, client)
-    return client
-
-
-QUERY = "SELECT *\nFROM orders\nWHERE customer_id = 7"
-
-
 class FakeStdin(io.TextIOWrapper):
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, tty: bool = False) -> None:
         super().__init__(io.BytesIO(data), encoding="utf-8")
+        self.tty = tty
+
+    def isatty(self) -> bool:
+        return self.tty
 
 
-def set_tty(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
-    def is_tty() -> bool:
-        return value
-
-    monkeypatch.setattr(cli, "_stdin_is_tty", is_tty)
+def pipe(monkeypatch: pytest.MonkeyPatch, data: bytes, tty: bool = False) -> None:
+    monkeypatch.setattr(sys, "stdin", FakeStdin(data, tty))
 
 
-def fake_editor(monkeypatch: pytest.MonkeyPatch, typed: str | None) -> None:
-    def edit(text: str, extension: str) -> str | None:
-        return None if typed is None else text + typed
-
-    monkeypatch.setattr(cli.click, "edit", edit)
+def write_project(body: str) -> None:
+    Path("pgsage.toml").write_text(body)
 
 
-def pipe(monkeypatch: pytest.MonkeyPatch, data: bytes) -> None:
-    monkeypatch.setattr(sys, "stdin", FakeStdin(data))
-    set_tty(monkeypatch, False)
+def run(*args: str, input: str | None = None) -> Any:
+    return runner.invoke(app, list(args), input=input)
 
 
-TAIL_MARKER = "end_of_the_long_query_marker"
-
-
-def long_query() -> str:
-    columns = ",\n       ".join(f"id AS column_{n}" for n in range(1, 700))
-    return f"SELECT {columns},\n       id AS {TAIL_MARKER}\nFROM orders\nWHERE customer_id = 7"
-
-
-def tune_args(dsn: str, *extra: str) -> list[str]:
-    return ["tune", "--dsn", dsn, *extra]
-
-
-def test_explain_from_file(tmp_path: Path) -> None:
-    path = tmp_path / "plan.json"
-    path.write_text(json.dumps(PLAN))
-    result = runner.invoke(cli.app, ["explain", str(path)])
-    assert result.exit_code == 0
-    assert "Seq scan dominates" in result.output
-    assert 'CREATE INDEX ON "orders" ("customer_id")' in result.output
-
-
-def test_explain_from_stdin() -> None:
-    result = runner.invoke(cli.app, ["explain"], input=json.dumps(PLAN))
-    assert result.exit_code == 0
-    assert "Cause: Missing index" in result.output
-
-
-def test_explain_invalid_input_exits_2() -> None:
-    result = runner.invoke(cli.app, ["explain"], input="not json")
-    assert result.exit_code == 2
-
-
-def test_explain_bad_model_reply_exits_2(fake_llm: FakeClient) -> None:
-    fake_llm.reply = "I cannot help"
-    result = runner.invoke(cli.app, ["explain"], input=json.dumps(PLAN))
-    assert result.exit_code == 2
-
-
-def test_explain_prints_evidence_confidence_and_ignored_actions(fake_llm: FakeClient) -> None:
-    reply: dict[str, Any] = {
-        "summary": "Seq scan dominates",
-        "root_cause": "Missing index",
-        "evidence": ["Seq Scan on orders: 300000 rows read"],
-        "actions": [
-            {
-                "description": "Add index",
-                "confidence": "high",
-                "expected_effect": "avoids reading 300000 rows",
-                "index": {"table": "orders", "columns": ["customer_id"]},
-            },
-            {"description": "Tune memory", "sql": "SET work_mem = '64MB'"},
-            {"description": "bad", "index": {"table": "orders", "columns": []}},
-        ],
-    }
-    fake_llm.reply = json.dumps(reply)
-    result = runner.invoke(cli.app, ["explain"], input=json.dumps(PLAN))
-    assert result.exit_code == 0
-    assert "evidence: Seq Scan on orders: 300000 rows read" in result.output
-    assert "[high confidence]" in result.output
-    assert "expect: avoids reading 300000 rows" in result.output
-    assert "ignored: action 3 rejected" in result.output
-    assert "not verified" in result.output and "SET work_mem" in result.output
-
-
-def test_explain_prints_token_and_cache_usage_when_the_client_reports_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = FakeClient(REPLY)
-    client.usage_log = [  # pyright: ignore[reportAttributeAccessIssue]
-        {
-            "input_tokens": 400,
-            "cache_read_input_tokens": 3000,
-            "cache_creation_input_tokens": 0,
-            "output_tokens": 120,
-        },
-        {
-            "input_tokens": 50,
-            "cache_read_input_tokens": 3400,
-            "cache_creation_input_tokens": 10,
-            "output_tokens": 80,
-        },
-    ]
-    use_client(monkeypatch, client)
-    result = runner.invoke(cli.app, ["explain"], input=json.dumps(PLAN))
-    assert "450 input, 6400 read from cache, 10 written to cache, 200 output" in result.output
-
-
-def test_make_client_rejects_an_unknown_provider() -> None:
-    with pytest.raises(ValueError, match="unknown provider"):
-        real_make_client("some-model", "bogus")
-
-
-def test_explain_exits_2_when_the_model_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Declining:
-        def complete(self, system: str, prompt: str) -> str:
-            raise ExplanationError("the model declined the request (category: cyber)")
-
-    def make_declining(
-        model: str | None,
-        provider: str = "anthropic",
-        base_url: str | None = None,
-        effort: str | None = "high",
-    ) -> Declining:
-        return Declining()
-
-    monkeypatch.setattr(cli, "make_client", make_declining)
-    result = runner.invoke(cli.app, ["explain"], input=json.dumps(PLAN))
-    assert result.exit_code == 2
-    assert "declined" in result.output
-
-
-def test_an_unknown_provider_or_effort_is_a_usage_error() -> None:
-    bad_provider = runner.invoke(
-        cli.app, ["explain", "--provider", "bogus"], input=json.dumps(PLAN)
-    )
-    bad_effort = runner.invoke(cli.app, ["explain", "--effort", "bogus"], input=json.dumps(PLAN))
-    assert bad_provider.exit_code == 2 and bad_effort.exit_code == 2
-    assert "bogus" in bad_provider.output + bad_effort.output
-
-
-def test_a_missing_plan_file_is_an_error_not_a_traceback(tmp_path: Path) -> None:
-    result = runner.invoke(cli.app, ["explain", str(tmp_path / "nope.json")])
-    assert result.exit_code == 2
-    assert result.output.startswith("error:") and "Traceback" not in result.output
-
-
-def test_version_flag_prints_the_package_version() -> None:
-    result = runner.invoke(cli.app, ["--version"])
-    assert result.exit_code == 0
-    assert result.output.startswith("pgsage ")
-
-
-def test_every_command_has_a_description_in_the_help() -> None:
-    output = runner.invoke(cli.app, ["--help"]).output
-    for command in ("explain", "tune", "verify", "top", "eval"):
-        row = next(
-            line for line in output.splitlines() if line.lstrip("│ ").startswith(f"{command} ")
-        )
-        assert len(row.lstrip("│ ")[len(command) :].strip(" │")) > 10, command
-
-
-def test_the_eval_help_describes_what_it_really_does() -> None:
-    output = runner.invoke(cli.app, ["eval", "--help"]).output
-    assert "pgsage_eval_" in output and "EMPTY" not in output
-
-
-def test_explain_labels_its_advice_as_unverified(fake_llm: FakeClient) -> None:
-    result = runner.invoke(cli.app, ["explain"], input=json.dumps(PLAN))
-    assert result.exit_code == 0
-    assert "Unverified: nothing above was measured" in result.output
-    assert "pgsage tune" in result.output
-
-
-def test_explain_warns_when_the_plan_has_no_timings(fake_llm: FakeClient) -> None:
-    plain = [{"Plan": {"Node Type": "Seq Scan", "Total Cost": 10.0, "Plan Rows": 5}}]
-    result = runner.invoke(cli.app, ["explain"], input=json.dumps(plain))
-    assert result.exit_code == 0
-    assert "no ANALYZE timings" in result.output
-    analyzed = runner.invoke(cli.app, ["explain"], input=json.dumps(PLAN))
-    assert "no ANALYZE timings" not in analyzed.output
-
-
-def test_tune_prints_proven_index(pg_dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    use_client(monkeypatch, FakeClient(REPLY))
-    result = runner.invoke(
-        cli.app,
-        ["tune", "--dsn", pg_dsn, "--sql", "SELECT * FROM orders WHERE customer_id = 7"],
-    )
-    assert result.exit_code == 0
-    assert "[PROVEN]" in result.output
-
-
-def test_verify_rejects_writes(pg_dsn: str) -> None:
-    result = runner.invoke(
-        cli.app,
-        [
-            "verify",
-            "--dsn",
-            pg_dsn,
-            "--sql",
-            "DELETE FROM orders",
-            "--table",
-            "orders",
-            "--columns",
-            "id",
-        ],
-    )
-    assert result.exit_code == 2
-
-
-def test_tune_report_dir_writes_a_report_json_and_a_runnable_script(
-    pg_dsn: str, pg_conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    use_client(monkeypatch, FakeClient(REPLY))
-    result = runner.invoke(
-        cli.app,
-        [
-            "tune",
-            "--dsn",
-            pg_dsn,
-            "--sql",
-            "SELECT * FROM orders WHERE customer_id = 7",
-            "--report-dir",
-            str(tmp_path),
-        ],
-    )
-    assert result.exit_code == 0
-    assert result.output.count("wrote ") == 3
-    markdown = next(tmp_path.glob("*.md")).read_text()
-    assert "## Proven changes" in markdown and "Baseline execution time" in markdown
-    data = json.loads(next(tmp_path.glob("*.json")).read_text())
-    assert data["changes"][0]["proven"] is True
-    script = next(tmp_path.glob("*.sql")).read_text()
-    statements = [
-        part.strip()
-        for part in "\n".join(
-            line for line in script.splitlines() if not line.startswith("--")
-        ).split(";")
-        if part.strip()
-    ]
-    try:
-        for statement in statements:
-            pg_conn.execute(literal(statement))
-        row = pg_conn.execute(
-            "SELECT count(*) FROM pg_indexes WHERE indexname = 'idx_orders_customer_id'"
-        ).fetchone()
-        assert row == (1,)
-        for statement in statements:
-            pg_conn.execute(literal(statement))
-    finally:
-        pg_conn.execute("DROP INDEX IF EXISTS idx_orders_customer_id")
-
-
-def test_tune_report_dir_can_avoid_concurrently(
-    pg_dsn: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    use_client(monkeypatch, FakeClient(REPLY))
-    runner.invoke(
-        cli.app,
-        [
-            "tune",
-            "--dsn",
-            pg_dsn,
-            "--sql",
-            "SELECT * FROM orders WHERE customer_id = 7",
-            "--report-dir",
-            str(tmp_path),
-            "--no-concurrently",
-        ],
-    )
-    assert "CONCURRENTLY" not in next(tmp_path.glob("*.sql")).read_text()
-
-
-def test_openai_provider_requires_a_model(pg_dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "make_client", real_make_client)
-    result = runner.invoke(
-        cli.app, ["tune", "--dsn", pg_dsn, "--sql", "SELECT 1", "--provider", "openai"]
-    )
-    assert result.exit_code == 2
-    assert "--model is required" in result.output
+def payload(result: Any) -> Any:
+    assert result.exit_code in (0, 1), result.stderr
+    return json.loads(result.stdout)
 
 
 def test_inline_sql_is_returned_trimmed() -> None:
@@ -374,37 +68,17 @@ def test_a_piped_query_is_used_when_no_source_is_given(monkeypatch: pytest.Monke
     assert read_query() == QUERY
 
 
-def test_a_terminal_with_no_source_opens_the_editor(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_tty(monkeypatch, True)
-    fake_editor(monkeypatch, "SELECT 42\n")
-    assert read_query() == "SELECT 42"
-
-
-def test_the_edit_flag_opens_the_editor_even_when_input_is_piped(
+def test_a_terminal_with_no_source_is_an_error_not_an_editor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pipe(monkeypatch, b"ignored")
-    fake_editor(monkeypatch, "SELECT 7")
-    assert read_query(edit=True) == "SELECT 7"
+    pipe(monkeypatch, b"", tty=True)
+    with pytest.raises(ValueError, match="--sql or --file"):
+        read_query()
 
 
-def test_the_editor_header_never_reaches_the_query(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_editor(monkeypatch, "SELECT 1")
-    assert "save and close" not in read_query(edit=True)
-
-
-def test_closing_the_editor_without_saving_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_editor(monkeypatch, None)
-    with pytest.raises(ValueError, match="without saving"):
-        read_query(edit=True)
-
-
-@pytest.mark.parametrize("combination", [("sql", "file"), ("sql", "edit"), ("file", "edit")])
-def test_two_sources_at_once_is_ambiguous(combination: tuple[str, str], tmp_path: Path) -> None:
-    kwargs = {"sql": "SELECT 1", "file": tmp_path / "q.sql", "edit": True}
-    chosen = {key: kwargs[key] for key in combination}
+def test_two_sources_at_once_is_ambiguous(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="only one of"):
-        read_query(**chosen)  # pyright: ignore[reportArgumentType]
+        read_query(sql="SELECT 1", file=tmp_path / "q.sql")
 
 
 @pytest.mark.parametrize("empty", ["", "   ", "\n\n\t\n"])
@@ -440,128 +114,428 @@ def test_an_enormous_stdin_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
         read_query(file=Path("-"))
 
 
-def test_a_missing_file_is_an_os_error_the_cli_reports(tmp_path: Path) -> None:
+def test_a_missing_file_is_an_os_error(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         read_query(file=tmp_path / "nope.sql")
 
 
-def test_a_long_multiline_query_from_a_file_reaches_the_prompt_untruncated(
-    pg_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client = FakeClient(REPLY)
-    use_client(monkeypatch, client)
-    path = tmp_path / "long.sql"
-    path.write_text(long_query())
-    assert len(long_query()) > 15_000
-    result = runner.invoke(cli.app, tune_args(pg_dsn, "--file", str(path), "--show-prompt"))
-    assert result.exit_code == 0, result.output
-    assert TAIL_MARKER in result.output
-    assert client.prompts == []
+def test_version_flag_prints_the_package_version() -> None:
+    result = run("--version")
+    assert result.exit_code == 0
+    assert result.stdout.startswith("pgsage ")
 
 
-def test_dry_run_reports_sizes_and_calls_no_model(
-    pg_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client = FakeClient(REPLY)
-    use_client(monkeypatch, client)
+def test_the_help_lists_exactly_the_agent_commands() -> None:
+    output = run("--help").stdout
+    for command in ("inspect", "verify", "top", "connections", "init", "install-skill"):
+        assert command in output
+
+
+@pytest.mark.parametrize("gone", ["tune", "eval", "explain"])
+def test_the_model_driven_commands_no_longer_exist(gone: str) -> None:
+    result = run(gone)
+    assert result.exit_code == 2
+    assert "No such command" in result.output
+
+
+def test_verify_without_a_subcommand_prints_its_help() -> None:
+    result = run("verify")
+    assert "index" in result.output and "statistics" in result.output and "rewrite" in result.output
+
+
+def test_inspect_prints_digest_and_tables_as_json(pg_dsn: str) -> None:
+    found = payload(run("inspect", "--dsn", pg_dsn, "--sql", QUERY))
+    assert found["digest"][0]["self_ms"] is not None
+    assert found["baseline_ms"] is not None
+    assert found["tables"][0]["name"] == "orders"
+    assert "plan" not in found
+
+
+def test_inspect_can_include_the_raw_plan(pg_dsn: str) -> None:
+    found = payload(run("inspect", "--dsn", pg_dsn, "--sql", QUERY, "--raw-plan"))
+    assert "Plan" in found["plan"]
+
+
+def test_inspect_reads_a_multiline_query_from_stdin(pg_dsn: str) -> None:
+    found = payload(run("inspect", "--dsn", pg_dsn, input=QUERY))
+    assert found["query"] == QUERY
+
+
+def test_inspect_reads_a_query_file(pg_dsn: str, tmp_path: Path) -> None:
     path = tmp_path / "q.sql"
-    path.write_text("SELECT * FROM orders WHERE customer_id = 7")
-    result = runner.invoke(cli.app, tune_args(pg_dsn, "-f", str(path), "--dry-run"))
-    assert result.exit_code == 0
-    assert "nothing was sent to a model" in result.output.lower()
-    assert "system prompt:" in result.output and "tokens in total" in result.output
-    assert "1 nodes" in result.output or "nodes, sent in full" in result.output
-    assert "UNTRUSTED INPUT BEGINS" not in result.output
-    assert client.prompts == []
+    path.write_text(QUERY)
+    assert payload(run("inspect", "--dsn", pg_dsn, "--file", str(path)))["query"] == QUERY
 
 
-def test_show_prompt_prints_exactly_what_would_be_sent_with_literals_redacted(
-    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    use_client(monkeypatch, FakeClient(REPLY))
-    query = "SELECT * FROM orders WHERE customer_id = 7 AND created_at > '2001-02-03'"
-    result = runner.invoke(cli.app, tune_args(pg_dsn, "--sql", query, "--show-prompt"))
-    assert result.exit_code == 0
-    assert "UNTRUSTED INPUT BEGINS" in result.output
-    assert "2001-02-03" not in result.output
-    assert "__L1__" in result.output
+def test_inspect_rejects_writes_with_a_friendly_error(pg_dsn: str) -> None:
+    result = run("inspect", "--dsn", pg_dsn, "--sql", "DELETE FROM orders")
+    assert result.exit_code == 2
+    assert result.stderr.startswith("error:")
+    assert result.stdout == ""
 
 
-def test_a_piped_query_works(pg_dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    use_client(monkeypatch, FakeClient(REPLY))
-    result = runner.invoke(
-        cli.app,
-        tune_args(pg_dsn, "--dry-run"),
-        input="SELECT * FROM orders\nWHERE customer_id = 7\n",
-    )
-    assert result.exit_code == 0, result.output
-    assert "Prompt built" in result.output
+def test_a_missing_query_file_is_a_clean_error(pg_dsn: str, tmp_path: Path) -> None:
+    result = run("inspect", "--dsn", pg_dsn, "--file", str(tmp_path / "nope.sql"))
+    assert result.exit_code == 2
+    assert result.stderr.startswith("error:")
 
 
 def test_two_query_sources_exit_2(pg_dsn: str, tmp_path: Path) -> None:
     path = tmp_path / "q.sql"
-    path.write_text("SELECT 1")
-    result = runner.invoke(
-        cli.app, tune_args(pg_dsn, "--sql", "SELECT 1", "--file", str(path), "--dry-run")
+    path.write_text(QUERY)
+    result = run("inspect", "--dsn", pg_dsn, "--sql", QUERY, "--file", str(path))
+    assert result.exit_code == 2
+    assert "only one of" in result.stderr
+
+
+def test_verify_index_proves_and_offers_the_apply_sql(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "index", "--dsn", pg_dsn, "--table", "orders", "--columns", "customer_id"),
+        *("--sql", QUERY),
     )
-    assert result.exit_code == 2
-    assert "only one of" in result.output
-
-
-def test_a_missing_query_file_is_a_clean_error(pg_dsn: str, tmp_path: Path) -> None:
-    result = runner.invoke(cli.app, tune_args(pg_dsn, "--file", str(tmp_path / "nope.sql")))
-    assert result.exit_code == 2
-    assert result.output.startswith("error:") and "Traceback" not in result.output
-
-
-def test_an_oversized_query_gets_a_clear_message_not_silent_truncation(
-    pg_dsn: str, tmp_path: Path
-) -> None:
-    path = tmp_path / "huge.sql"
-    path.write_text("SELECT 1 /* " + "x" * 120_000 + " */ FROM orders WHERE customer_id = 7")
-    result = runner.invoke(cli.app, tune_args(pg_dsn, "--file", str(path), "--dry-run"))
-    assert result.exit_code == 2
-    assert "characters; the limit is" in result.output
-
-
-def test_verify_reads_its_query_from_a_file_too(pg_dsn: str, tmp_path: Path) -> None:
-    path = tmp_path / "q.sql"
-    path.write_text("SELECT *\nFROM orders\nWHERE customer_id = 7\n")
-    result = runner.invoke(
-        cli.app,
-        [
-            "verify",
-            "--dsn",
-            pg_dsn,
-            "--file",
-            str(path),
-            "--table",
-            "orders",
-            "--columns",
-            "customer_id",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    assert "[PROVEN]" in result.output
-
-
-def test_top_command_prints_placeholder_hint(stats_dsn: str) -> None:
-    result = CliRunner().invoke(app, ["top", "--dsn", stats_dsn])
+    verdict = payload(result)
     assert result.exit_code == 0
-    assert "$1" in result.output
+    assert verdict["improved"] is True
+    assert verdict["speedup"] > 1
+    assert verdict["after"]["uses_new_index"] is True
+    assert verdict["apply"][0].startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS")
+
+
+def test_verify_index_reads_its_query_from_a_file(pg_dsn: str, tmp_path: Path) -> None:
+    path = tmp_path / "q.sql"
+    path.write_text(QUERY)
+    verdict = payload(
+        run(
+            *("verify", "index", "--dsn", pg_dsn, "--table", "orders", "--columns", "customer_id"),
+            *("--file", str(path)),
+        )
+    )
+    assert verdict["improved"] is True
+
+
+def test_verify_index_exits_1_and_offers_nothing_when_not_proven(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "index", "--dsn", pg_dsn, "--table", "orders", "--columns", "id"),
+        *("--sql", QUERY),
+    )
+    verdict = payload(result)
+    assert result.exit_code == 1
+    assert verdict["improved"] is False
+    assert verdict["apply"] == []
+
+
+def test_verify_index_passes_include_and_where_through(pg_dsn: str) -> None:
+    verdict = payload(
+        run(
+            *("verify", "index", "--dsn", pg_dsn, "--table", "orders", "--columns", "customer_id"),
+            *("--include", "created_at", "--where", "customer_id < 50", "--sql", QUERY),
+        )
+    )
+    assert "INCLUDE" in verdict["statement"] and "WHERE" in verdict["statement"]
+
+
+def test_verify_index_rejects_an_unknown_method(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "index", "--dsn", pg_dsn, "--table", "orders", "--columns", "id"),
+        *("--method", "gist", "--sql", QUERY),
+    )
+    assert result.exit_code == 2
+
+
+def test_verify_rejects_writes(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "index", "--dsn", pg_dsn, "--table", "orders", "--columns", "id"),
+        *("--sql", "DELETE FROM orders"),
+    )
+    assert result.exit_code == 2
+    assert result.stderr.startswith("error:")
+
+
+def test_a_bad_column_is_an_unproven_result_not_a_traceback(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "index", "--dsn", pg_dsn, "--table", "orders", "--columns", "nope"),
+        *("--sql", QUERY),
+    )
+    assert result.exit_code == 1
+    verdict = json.loads(result.stdout)
+    assert verdict["improved"] is False
+    assert "nope" in verdict["error"] and verdict["apply"] == []
+
+
+def test_verify_statistics_reports_a_statistics_proof(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "statistics", "--dsn", pg_dsn, "--table", "orders"),
+        *("--columns", "id,customer_id", "--kinds", "dependencies"),
+        *("--sql", "SELECT * FROM orders WHERE id = 5 AND customer_id = 5"),
+    )
+    verdict = payload(result)
+    assert verdict["kind"] == "statistics"
+    assert "dependencies" in verdict["statement"]
+    assert verdict["error"] is None
+
+
+def test_verify_statistics_needs_two_columns(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "statistics", "--dsn", pg_dsn, "--table", "orders", "--columns", "id"),
+        *("--sql", QUERY),
+    )
+    assert result.exit_code == 2
+    assert result.stderr.startswith("error:")
+
+
+def test_verify_statistics_rejects_an_unknown_kind(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "statistics", "--dsn", pg_dsn, "--table", "orders"),
+        *("--columns", "id,customer_id", "--kinds", "bogus", "--sql", QUERY),
+    )
+    assert result.exit_code == 2
+    assert result.stderr.startswith("error:")
+
+
+def test_verify_rewrite_exits_1_for_an_identical_query(pg_dsn: str) -> None:
+    result = run("verify", "rewrite", "--dsn", pg_dsn, "--sql", QUERY, "--rewrite", QUERY)
+    verdict = payload(result)
+    assert result.exit_code == 1
+    assert "identical" in verdict["error"]
+
+
+def test_verify_rewrite_reports_equivalence_for_a_different_query(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "rewrite", "--dsn", pg_dsn, "--sql", QUERY),
+        *("--rewrite", "SELECT * FROM orders WHERE customer_id = 7 AND id > 0"),
+    )
+    verdict = payload(result)
+    assert verdict["kind"] == "rewrite"
+    assert verdict["equivalent"] is True
+    assert verdict["apply"] == []
+
+
+def test_verify_rewrite_flags_a_rewrite_that_changes_the_result(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "rewrite", "--dsn", pg_dsn, "--sql", QUERY),
+        *("--rewrite", "SELECT * FROM orders WHERE customer_id = 8"),
+    )
+    verdict = payload(result)
+    assert result.exit_code == 1
+    assert verdict["equivalent"] is False
+
+
+def test_verify_rewrite_reads_the_new_query_from_a_file(pg_dsn: str, tmp_path: Path) -> None:
+    path = tmp_path / "new.sql"
+    path.write_text("SELECT * FROM orders WHERE customer_id = 7 AND id > 0")
+    verdict = payload(
+        run("verify", "rewrite", "--dsn", pg_dsn, "--sql", QUERY, "--rewrite-file", str(path))
+    )
+    assert verdict["equivalent"] is True
+
+
+def test_verify_rewrite_needs_exactly_one_new_query(pg_dsn: str, tmp_path: Path) -> None:
+    neither = run("verify", "rewrite", "--dsn", pg_dsn, "--sql", QUERY)
+    assert neither.exit_code == 2
+    assert "exactly one of" in neither.stderr
+    path = tmp_path / "new.sql"
+    path.write_text(QUERY)
+    both = run(
+        *("verify", "rewrite", "--dsn", pg_dsn, "--sql", QUERY),
+        *("--rewrite", QUERY, "--rewrite-file", str(path)),
+    )
+    assert both.exit_code == 2
+
+
+def test_verify_rewrite_rejects_a_write(pg_dsn: str) -> None:
+    result = run(
+        "verify", "rewrite", "--dsn", pg_dsn, "--sql", QUERY, "--rewrite", "DELETE FROM orders"
+    )
+    assert result.exit_code == 2
+    assert result.stderr.startswith("error:")
+
+
+def test_dsn_and_connection_together_fail_cleanly() -> None:
+    result = run("top", "--dsn", "postgresql://x/d", "--connection", "a")
+    assert result.exit_code == 2
+    assert "either --dsn or --connection" in result.stderr
+
+
+def test_a_named_connection_reports_itself_on_stderr_only(pg_dsn: str) -> None:
+    write_project(f'default_connection = "scratch"\n[connections.scratch]\ndsn = "{pg_dsn}"\n')
+    result = run("inspect", "--sql", QUERY)
+    assert result.exit_code == 0, result.stderr
+    assert "using connection scratch" in result.stderr
+    assert json.loads(result.stdout)["tables"][0]["name"] == "orders"
+
+
+def test_protected_connections_refuse_every_proof(pg_dsn: str) -> None:
+    write_project(f'[connections.prod]\ndsn = "{pg_dsn}"\nprotected = true\n')
+    attempts = (
+        ["verify", "index", "--table", "orders", "--columns", "id", "--sql", QUERY],
+        [
+            *("verify", "statistics", "--table", "orders", "--columns", "id,customer_id"),
+            *("--sql", QUERY),
+        ],
+        ["verify", "rewrite", "--sql", QUERY, "--rewrite", QUERY + " "],
+    )
+    for args in attempts:
+        result = run(*args, "-c", "prod")
+        assert result.exit_code == 2, args
+        assert "is protected" in result.stderr, args
+
+
+def test_protected_connections_still_allow_inspect_and_top(stats_dsn: str) -> None:
+    write_project(f'[connections.prod]\ndsn = "{stats_dsn}"\nprotected = true\n')
+    assert run("inspect", "-c", "prod", "--sql", "SELECT * FROM t WHERE id = 5").exit_code == 0
+    assert run("top", "-c", "prod").exit_code == 0
+
+
+def test_top_prints_a_json_list_with_placeholders(stats_dsn: str) -> None:
+    rows: list[dict[str, Any]] = payload(run("top", "--dsn", stats_dsn))
+    assert "$1" in rows[0]["query"]
+    assert {"calls", "total_ms", "mean_ms"} <= set(rows[0])
 
 
 def test_top_without_extension_explains_how_to_enable(pg_dsn: str) -> None:
-    result = CliRunner().invoke(app, ["top", "--dsn", pg_dsn])
+    result = run("top", "--dsn", pg_dsn)
     assert result.exit_code == 2
-    assert "shared_preload_libraries" in result.output
+    assert "shared_preload_libraries" in result.stderr
 
 
-def test_top_command_honours_limit_and_min_calls(stats_dsn: str) -> None:
-    runner = CliRunner()
-    one = runner.invoke(app, ["top", "--dsn", stats_dsn, "--limit", "1"])
-    assert one.exit_code == 0
-    assert one.output.count(" calls, ") == 1
-    none = runner.invoke(app, ["top", "--dsn", stats_dsn, "--min-calls", "1000000"])
-    assert none.exit_code == 0
-    assert " calls, " not in none.output
+def test_top_honours_limit_and_min_calls(stats_dsn: str) -> None:
+    assert len(payload(run("top", "--dsn", stats_dsn, "--limit", "1"))) == 1
+    assert payload(run("top", "--dsn", stats_dsn, "--min-calls", "1000000")) == []
+
+
+def test_connections_lists_nothing_as_an_empty_json_list() -> None:
+    assert payload(run("connections")) == []
+
+
+def test_connections_json_lists_machine_readable_entries() -> None:
+    write_project(
+        'default_connection = "a"\n[connections.a]\nhost = "ha"\nuser = "u"\ndbname = "d"\n'
+        "protected = true\n"
+    )
+    (entry,) = payload(run("connections"))
+    assert entry["name"] == "a" and entry["default"] and entry["protected"]
+    assert entry["target"] == "u@ha:5432/d"
+    assert entry["source"].endswith("pgsage.toml")
+
+
+def test_connections_test_reaches_a_real_server(pg_dsn: str) -> None:
+    found = payload(run("connections", "test", "--dsn", pg_dsn))
+    assert found["version"].startswith("PostgreSQL 17")
+    assert found["read_only_session"] is False
+    assert found["pg_stat_statements"] is False
+
+
+def test_connections_test_sees_pg_stat_statements(stats_dsn: str) -> None:
+    assert payload(run("connections", "test", "--dsn", stats_dsn))["pg_stat_statements"] is True
+
+
+def test_connections_test_names_an_unreachable_server() -> None:
+    write_project('[connections.dead]\nhost = "127.0.0.1"\nport = 1\n')
+    result = run("connections", "test", "dead")
+    assert result.exit_code == 2
+    assert result.stderr.splitlines()[-1].startswith("error:")
+
+
+def skill_text() -> str:
+    return (files("pgsage") / "skill" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_install_skill_writes_the_packaged_skill_into_the_project() -> None:
+    result = run("install-skill")
+    path = Path.cwd() / ".claude" / "skills" / "pgsage" / "SKILL.md"
+    assert result.exit_code == 0, result.stderr
+    assert path.read_text(encoding="utf-8") == skill_text()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert str(path) in result.stdout
+
+
+def test_install_skill_user_uses_the_home_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert run("install-skill", "--user").exit_code == 0
+    assert (Path.home() / ".claude" / "skills" / "pgsage" / "SKILL.md").is_file()
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_install_skill_dir_targets_another_agent(tmp_path: Path) -> None:
+    target = tmp_path / "other-agent" / "skills"
+    assert run("install-skill", "--dir", str(target)).exit_code == 0
+    assert (target / "pgsage" / "SKILL.md").read_text(encoding="utf-8") == skill_text()
+
+
+def test_install_skill_never_overwrites_without_force() -> None:
+    assert run("install-skill").exit_code == 0
+    path = Path.cwd() / ".claude" / "skills" / "pgsage" / "SKILL.md"
+    path.write_text("customised")
+    again = run("install-skill")
+    assert again.exit_code == 2
+    assert "already exists" in again.stderr
+    assert path.read_text() == "customised"
+    assert run("install-skill", "--force").exit_code == 0
+    assert path.read_text(encoding="utf-8") == skill_text()
+
+
+PLAN = [
+    {
+        "Plan": {
+            "Node Type": "Seq Scan",
+            "Relation Name": "orders",
+            "Filter": "(customer_id = 7)",
+            "Startup Cost": 0.0,
+            "Total Cost": 10.0,
+            "Plan Rows": 2000,
+            "Actual Rows": 2000,
+            "Actual Loops": 1,
+            "Actual Total Time": 20.0,
+            "Rows Removed by Filter": 198000,
+        },
+        "Execution Time": 20.0,
+    }
+]
+
+
+def test_summarize_digests_a_plan_from_a_file_or_stdin(tmp_path: Path) -> None:
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps(PLAN))
+    from_file = payload(run("summarize", "--file", str(plan)))
+    from_stdin = payload(run("summarize", input=json.dumps(PLAN)))
+    assert from_file == from_stdin
+    assert from_file[0]["node"] == "Seq Scan"
+
+
+def test_summarize_explains_how_to_get_a_json_plan() -> None:
+    result = run("summarize", input="Seq Scan on orders  (cost=0.00..10.00)")
+    assert result.exit_code == 2
+    assert "FORMAT JSON" in result.stderr
+
+
+def test_inspect_accepts_fetch_first(pg_dsn: str) -> None:
+    result = run(
+        "inspect",
+        "--dsn",
+        pg_dsn,
+        "--sql",
+        "SELECT * FROM orders ORDER BY id FETCH FIRST 3 ROWS ONLY",
+    )
+    assert result.exit_code == 0, result.stderr
+
+
+def test_a_pasted_explain_prefix_gets_a_clear_message(pg_dsn: str) -> None:
+    result = run("inspect", "--dsn", pg_dsn, "--sql", "EXPLAIN ANALYZE SELECT 1")
+    assert result.exit_code == 2
+    assert "remove the EXPLAIN keyword" in result.stderr
+
+
+def test_an_explicit_flag_overrides_the_environment(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PGSAGE_CONNECTION", "does-not-exist")
+    result = run("inspect", "--dsn", pg_dsn, "--sql", "SELECT 1")
+    assert result.exit_code == 0, result.stderr
+
+
+def test_a_malformed_connection_string_is_not_echoed() -> None:
+    result = run("inspect", "--dsn", "postgres://u:p%zzsecret@h/db", "--sql", "SELECT 1")
+    assert result.exit_code == 2
+    assert "secret" not in result.stderr and "secret" not in result.stdout

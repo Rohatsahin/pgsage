@@ -36,6 +36,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         item.add_marker(pytest.mark.skip(reason=reason))
 
 
+@pytest.fixture(autouse=True)
+def isolated_config(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.chdir(home)
+    for name in ("PGSAGE_CONFIG", "PGSAGE_CONNECTION"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("PGSERVICE", "PGHOST", "PGHOSTADDR", "PGDATABASE", "PGUSER", "PGPASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="session")
 def pg_dsn() -> Iterator[str]:
     with PostgresContainer("postgres:17", driver=None) as pg:

@@ -98,7 +98,12 @@ class ExplainResult(BaseModel):
 
 
 def parse_explain(raw: str | list[Any] | dict[str, Any]) -> ExplainResult:
-    data: object = json.loads(raw) if isinstance(raw, str) else raw
+    try:
+        data: object = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError as error:
+        raise ValueError(
+            "the plan is not JSON; use EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)"
+        ) from error
     if isinstance(data, list):
         items = cast("list[object]", data)
         if len(items) != 1:

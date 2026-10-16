@@ -1,58 +1,77 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
-from enum import StrEnum
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
+from importlib.resources import files
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
-import click
 import psycopg
 import typer
 
-from pgsage.ai import (
-    DEFAULT_MODEL,
-    SYSTEM_PROMPT,
-    AnthropicClient,
-    Explanation,
-    ExplanationError,
-    LLMClient,
-    OpenAICompatibleClient,
-    explain_plan,
-    prompt_stats,
+from pgsage.config import (
+    PROJECT_FILE,
+    TEMPLATE,
+    ConfigError,
+    Target,
+    load_config,
+    resolve_target,
+    user_config_path,
 )
-from pgsage.context import top_queries
-from pgsage.evals import CASES, OracleClient, run_evals
-from pgsage.plan import parse_explain
-from pgsage.report import write_report
-from pgsage.tune import DEFAULT_ROUNDS, TuneReport, prepare_prompt, tune
-from pgsage.verify import IndexSuggestion, VerifyResult, verify_index
+from pgsage.context import inspect_query, top_queries
+from pgsage.db import connect, describe_error
+from pgsage.plan import parse_explain, plan_digest
+from pgsage.verify import (
+    IndexMethod,
+    IndexSuggestion,
+    StatsSuggestion,
+    VerifyResult,
+    verify_index,
+    verify_rewrite,
+    verify_statistics,
+)
 
-app = typer.Typer(help="AI-native PostgreSQL query plan tuning", no_args_is_help=True)
+app = typer.Typer(
+    help="Plan facts and proofs for PostgreSQL query tuning, built for AI agents. "
+    "Every command prints JSON.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+verify_app = typer.Typer(
+    help="Prove a change: apply it, measure it, roll it back.", no_args_is_help=True
+)
+connections_app = typer.Typer(help="Named database connections")
+app.add_typer(verify_app, name="verify")
+app.add_typer(connections_app, name="connections")
 
-Dsn = Annotated[str, typer.Option(help="Connection string of a dev or scratch database")]
+MAX_QUERY_BYTES = 1_000_000
+SKILL_NAME = "pgsage"
+PRIVATE_FILE = 0o600
+PUBLIC_FILE = 0o644
 
-
-class ProviderChoice(StrEnum):
-    ANTHROPIC = "anthropic"
-    OPENAI = "openai"
-
-
-class EffortChoice(StrEnum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    XHIGH = "xhigh"
-    MAX = "max"
-
-
-Provider = Annotated[
-    ProviderChoice, typer.Option(help="anthropic, or openai for any OpenAI-compatible API")
+DsnOption = Annotated[
+    str | None,
+    typer.Option(
+        help="Connection string (or set PGSAGE_DSN). Prefer --connection: a password here "
+        "shows up in `ps`",
+    ),
 ]
-Model = Annotated[str | None, typer.Option(help="Model name; defaults per provider")]
-Effort = Annotated[EffortChoice, typer.Option(help="Thinking effort for Claude models")]
-BaseUrl = Annotated[str | None, typer.Option(help="Base URL for the openai provider")]
+ConnectionOption = Annotated[
+    str | None,
+    typer.Option(
+        "--connection",
+        "-c",
+        help="Named connection from pgsage.toml or ~/.config/pgsage/config.toml "
+        "(or set PGSAGE_CONNECTION)",
+    ),
+]
+SqlOption = Annotated[str | None, typer.Option("--sql", help="The SELECT, given inline")]
+FileOption = Annotated[
+    Path | None, typer.Option("--file", "-f", help="Read the SELECT from a file (- for stdin)")
+]
 
 
 def _print_version(value: bool) -> None:
@@ -74,21 +93,13 @@ def main(
     pass
 
 
-MAX_QUERY_BYTES = 1_000_000
-EDITOR_HEADER = "-- Write or paste one read-only SELECT below, then save and close the editor.\n"
-
-SqlOption = Annotated[
-    str | None, typer.Option("--sql", help="The SELECT, given inline (see also --file, --edit)")
-]
-FileOption = Annotated[
-    Path | None,
-    typer.Option("--file", "-f", help="Read the SELECT from a file (use - for stdin)"),
-]
-EditOption = Annotated[bool, typer.Option("--edit", "-e", help="Write the SELECT in your $EDITOR")]
+def _print_json(payload: object) -> None:
+    typer.echo(json.dumps(payload, indent=2, default=str))
 
 
-def _stdin_is_tty() -> bool:
-    return sys.stdin.isatty()
+def _fail(error: Exception, code: int = 2) -> typer.Exit:
+    typer.echo(f"error: {describe_error(error)}", err=True)
+    return typer.Exit(code)
 
 
 def _decode(data: bytes, source: str) -> str:
@@ -117,280 +128,266 @@ def _read_file(path: Path) -> str:
     return _decode(path.read_bytes(), str(path))
 
 
-def _edit_query() -> str:
-    edited = click.edit(EDITOR_HEADER + "\n", extension=".sql")
-    if edited is None:
-        raise ValueError("the editor closed without saving a query")
-    return edited.replace(EDITOR_HEADER, "", 1)
-
-
-def read_query(sql: str | None = None, file: Path | None = None, edit: bool = False) -> str:
-    if sum(source is not None and source is not False for source in (sql, file, edit)) > 1:
-        raise ValueError("use only one of --sql, --file and --edit")
+def read_query(sql: str | None = None, file: Path | None = None) -> str:
+    if sql is not None and file is not None:
+        raise ValueError("use only one of --sql and --file")
     if sql is not None:
         text = sql
     elif file is not None:
         text = _read_file(file)
-    elif edit or _stdin_is_tty():
-        typer.echo(
-            "Opening your editor for the query (or use --sql, --file, or pipe it in)...", err=True
-        )
-        text = _edit_query()
+    elif sys.stdin.isatty():
+        raise ValueError("give the query with --sql or --file, or pipe it in on stdin")
     else:
         text = _read_stdin()
-    text = text.lstrip("\ufeff").strip()
-    if not text:
+    return _clean_query(text)
+
+
+def _clean_query(text: str) -> str:
+    cleaned = text.lstrip(chr(0xFEFF)).strip()
+    if not cleaned:
         raise ValueError("the query is empty")
-    return text
+    return cleaned
 
 
-def make_client(
-    model: str | None,
-    provider: str = "anthropic",
-    base_url: str | None = None,
-    effort: str | None = "high",
-) -> LLMClient:
-    if provider == "openai":
-        if not model:
-            raise ValueError("--model is required with --provider openai")
-        return OpenAICompatibleClient(
-            model=model,
-            base_url=base_url or "http://localhost:11434/v1",
-            api_key=os.environ.get("OPENAI_API_KEY"),
-        )
-    if provider != "anthropic":
-        raise ValueError(f"unknown provider {provider!r}")
-    return AnthropicClient(model=model or DEFAULT_MODEL, effort=effort)
+def _target(dsn: str | None, connection: str | None, writes: bool = False) -> Target:
+    target = resolve_target(dsn, connection, writes)
+    if target.name:
+        typer.echo(f"using connection {target.name} ({target.label})", err=True)
+    return target
 
 
-def _fail(error: Exception, code: int = 2) -> typer.Exit:
-    typer.echo(f"error: {error}", err=True)
-    return typer.Exit(code)
+def _split(text: str) -> list[str]:
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 
-def _echo_usage(client: object) -> None:
-    log: list[dict[str, int]] = getattr(client, "usage_log", [])
-    if not log:
-        return
-    total = {key: sum(call.get(key, 0) for call in log) for key in log[0]}
-    typer.echo(
-        f"\n(tokens: {total['input_tokens']} input, {total['cache_read_input_tokens']} read from "
-        f"cache, {total['cache_creation_input_tokens']} written to cache, "
-        f"{total['output_tokens']} output)"
-    )
-
-
-def _echo_explanation(explanation: Explanation) -> None:
-    typer.echo(explanation.summary)
-    typer.echo(f"\nCause: {explanation.root_cause}")
-    for line in explanation.evidence:
-        typer.echo(f"  evidence: {line}")
-    for problem in explanation.rejected:
-        typer.echo(f"  ignored: {problem}")
-    for action in explanation.actions:
-        typer.echo(f"\n- {action.description} [{action.confidence} confidence]")
-        if action.expected_effect:
-            typer.echo(f"    expect: {action.expected_effect}")
-        if action.sql:
-            typer.echo(
-                f"    (advice from the model, not verified; review before running) {action.sql}"
-            )
-        if action.index:
-            typer.echo(f"    {action.index.ddl}")
-        if action.statistics:
-            typer.echo(f"    {action.statistics.ddl}")
-        if action.rewrite:
-            typer.echo(f"    {action.rewrite}")
-
-
-def _echo_result(result: VerifyResult) -> None:
-    verdict = "PROVEN" if result.improved else "NOT PROVEN"
-    speedup = f", {result.speedup:.1f}x faster" if result.improved and result.speedup else ""
-    equivalence = " (results differ!)" if result.equivalent is False else ""
-    if result.error:
-        typer.echo(f"\n[NOT PROVEN] {result.kind}: {result.statement}\n    {result.error}")
-        return
-    if result.note:
-        equivalence += f" ({result.note})"
-    typer.echo(
-        f"\n[{verdict}] {result.kind}: {result.statement}{equivalence}\n"
-        f"    cost {result.before.total_cost:.1f} -> {result.after.total_cost:.1f}, "
-        f"{result.before.execution_ms} ms -> {result.after.execution_ms} ms{speedup}"
-    )
-
-
-def _echo_report(report: TuneReport) -> None:
-    _echo_explanation(report.explanation)
-    for change in report.verified:
-        _echo_result(change.result)
-    if report.rounds > 1:
-        typer.echo(f"\n({report.rounds} rounds)")
-
-
-@app.command(
-    name="explain",
-    help="Explain a plan you already have with an LLM (unverified; tune proves changes).",
-)
-def explain_command(
-    file: Annotated[Path | None, typer.Argument(help="EXPLAIN JSON file; stdin if omitted")] = None,
-    model: Model = None,
-    provider: Provider = ProviderChoice.ANTHROPIC,
-    base_url: BaseUrl = None,
-    effort: Effort = EffortChoice.HIGH,
-) -> None:
+def _prove(run: Callable[[], VerifyResult]) -> None:
     try:
-        raw = file.read_text() if file else sys.stdin.read()
-        plan = parse_explain(raw)
-        client = make_client(model, provider.value, base_url, effort.value)
-        if not plan.analyzed:
-            typer.echo(
-                "warning: this plan has no ANALYZE timings, so the analysis will be shallow; "
-                "use EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)",
-                err=True,
-            )
-        explanation = explain_plan(client, plan)
-    except (ValueError, ExplanationError, OSError) as error:
+        result = run()
+    except (ValueError, OSError, psycopg.Error) as error:
         raise _fail(error) from error
-    _echo_explanation(explanation)
-    typer.echo(
-        "\nUnverified: nothing above was measured. `pgsage tune` proves changes on a database."
-    )
-    _echo_usage(client)
-
-
-def _dry_run(dsn: str, query: str, show_prompt: bool) -> None:
-    prepared = prepare_prompt(dsn, query)
-    stats = prompt_stats(SYSTEM_PROMPT, prepared.prompt)
-    typer.echo("Prompt built; nothing was sent to a model.")
-    typer.echo(f"  system prompt: {stats['system_chars']:,} characters (static, cached)")
-    typer.echo(
-        f"  query, plan and tables: {stats['stable_chars']:,} characters (cached across rounds)"
-    )
-    typer.echo(
-        f"  about {stats['approx_tokens']:,} tokens in total (estimate: 1 token per 4 characters)"
-    )
-    plan = (
-        f"{prepared.plan_nodes} nodes, raw plan omitted (digest and hotspots sent)"
-        if prepared.raw_plan_omitted
-        else f"{prepared.plan_nodes} nodes, sent in full"
-    )
-    typer.echo(f"  plan: {plan}; tables: {prepared.tables}")
-    if show_prompt:
-        typer.echo("\n--- prompt (after the system prompt) ---")
-        typer.echo(str(prepared.prompt))
-
-
-@app.command(
-    name="tune",
-    help="Fetch the plan, ask the LLM for fixes, and prove each proposal on the database.",
-)
-def tune_command(
-    dsn: Dsn,
-    sql: SqlOption = None,
-    file: FileOption = None,
-    edit: EditOption = False,
-    model: Model = None,
-    provider: Provider = ProviderChoice.ANTHROPIC,
-    base_url: BaseUrl = None,
-    effort: Effort = EffortChoice.HIGH,
-    rounds: Annotated[
-        int, typer.Option(help="Max AI attempts if nothing is proven")
-    ] = DEFAULT_ROUNDS,
-    report_dir: Annotated[
-        Path | None,
-        typer.Option(
-            help="Write a Markdown report, a JSON report and a SQL script of proven changes"
-        ),
-    ] = None,
-    concurrently: Annotated[
-        bool, typer.Option(help="Use CREATE INDEX CONCURRENTLY in the SQL script")
-    ] = True,
-    dry_run: Annotated[
-        bool,
-        typer.Option("--dry-run", help="Build the prompt and print its size; call no model"),
-    ] = False,
-    show_prompt: Annotated[
-        bool,
-        typer.Option("--show-prompt", help="Print the exact prompt that would be sent (dry run)"),
-    ] = False,
-) -> None:
-    try:
-        query = read_query(sql, file, edit)
-        if dry_run or show_prompt:
-            _dry_run(dsn, query, show_prompt)
-            return
-        client = make_client(model, provider.value, base_url, effort.value)
-        report = tune(client, dsn, query, max_rounds=rounds)
-    except (ValueError, ExplanationError, psycopg.Error, OSError) as error:
-        raise _fail(error) from error
-    _echo_report(report)
-    _echo_usage(client)
-    if report_dir is not None:
-        for path in write_report(report_dir, report, concurrently=concurrently):
-            typer.echo(f"wrote {path}")
-
-
-@app.command(name="verify", help="Prove one index you chose: apply, measure, roll back.")
-def verify_command(
-    dsn: Dsn,
-    table: Annotated[str, typer.Option()],
-    columns: Annotated[str, typer.Option(help="Comma-separated index columns")],
-    schema: Annotated[str | None, typer.Option()] = None,
-    sql: SqlOption = None,
-    file: FileOption = None,
-    edit: EditOption = False,
-) -> None:
-    suggestion = IndexSuggestion(
-        table=table, columns=[c.strip() for c in columns.split(",")], schema_name=schema
-    )
-    try:
-        result = verify_index(dsn, read_query(sql, file, edit), suggestion)
-    except (ValueError, psycopg.Error, OSError) as error:
-        raise _fail(error) from error
-    _echo_result(result)
+    _print_json(result.as_dict())
     if not result.improved:
         raise typer.Exit(1)
 
 
-@app.command(name="top", help="List the costliest SELECTs from pg_stat_statements.")
+@app.command(
+    name="inspect",
+    help="The plan digest and table facts for a SELECT. Runs EXPLAIN ANALYZE.",
+)
+def inspect_command(
+    connection: ConnectionOption = None,
+    dsn: DsnOption = None,
+    sql: SqlOption = None,
+    file: FileOption = None,
+    raw_plan: Annotated[bool, typer.Option(help="Also include the raw EXPLAIN plan")] = False,
+) -> None:
+    try:
+        target = _target(dsn, connection)
+        _print_json(inspect_query(target.conninfo, read_query(sql, file), raw_plan))
+    except (ValueError, psycopg.Error, OSError) as error:
+        raise _fail(error) from error
+
+
+@app.command(
+    name="summarize",
+    help="The plan digest for EXPLAIN (ANALYZE, FORMAT JSON) output you already have. "
+    "No database needed.",
+)
+def summarize_command(
+    file: Annotated[
+        Path | None, typer.Option("--file", "-f", help="Plan file; stdin if omitted")
+    ] = None,
+) -> None:
+    try:
+        raw = _read_file(file) if file is not None else _read_stdin()
+        _print_json(plan_digest(parse_explain(raw)))
+    except (ValueError, OSError) as error:
+        raise _fail(error) from error
+
+
+@verify_app.command(name="index", help="Prove an index. Exit 1 if it is not proven.")
+def verify_index_command(
+    table: Annotated[str, typer.Option()],
+    columns: Annotated[str, typer.Option(help="Comma-separated key columns")],
+    connection: ConnectionOption = None,
+    dsn: DsnOption = None,
+    schema: Annotated[str | None, typer.Option()] = None,
+    method: Annotated[IndexMethod, typer.Option(help="btree, hash, gin or brin")] = "btree",
+    include: Annotated[str, typer.Option(help="Comma-separated covering columns")] = "",
+    where: Annotated[str | None, typer.Option(help="Partial index predicate")] = None,
+    sql: SqlOption = None,
+    file: FileOption = None,
+) -> None:
+    try:
+        suggestion = IndexSuggestion(
+            table=table,
+            columns=_split(columns),
+            schema_name=schema,
+            method=method,
+            include=_split(include),
+            where=where,
+        )
+        target = _target(dsn, connection, writes=True)
+        query = read_query(sql, file)
+    except (ValueError, OSError) as error:
+        raise _fail(error) from error
+    _prove(lambda: verify_index(target.conninfo, query, suggestion))
+
+
+@verify_app.command(name="statistics", help="Prove extended statistics. Exit 1 if not proven.")
+def verify_statistics_command(
+    table: Annotated[str, typer.Option()],
+    columns: Annotated[str, typer.Option(help="Comma-separated columns (at least two)")],
+    connection: ConnectionOption = None,
+    dsn: DsnOption = None,
+    schema: Annotated[str | None, typer.Option()] = None,
+    kinds: Annotated[str, typer.Option(help="dependencies, ndistinct, mcv (comma-separated)")] = "",
+    sql: SqlOption = None,
+    file: FileOption = None,
+) -> None:
+    try:
+        wanted: dict[str, Any] = {"table": table, "columns": _split(columns), "schema_name": schema}
+        if kinds:
+            wanted["kinds"] = _split(kinds)
+        suggestion = StatsSuggestion.model_validate(wanted)
+        target = _target(dsn, connection, writes=True)
+        query = read_query(sql, file)
+    except (ValueError, OSError) as error:
+        raise _fail(error) from error
+    _prove(lambda: verify_statistics(target.conninfo, query, suggestion))
+
+
+@verify_app.command(name="rewrite", help="Prove a rewrite returns the same rows, faster.")
+def verify_rewrite_command(
+    rewrite: Annotated[str | None, typer.Option(help="The rewritten SELECT")] = None,
+    rewrite_file: Annotated[
+        Path | None, typer.Option(help="Read the rewritten SELECT from a file")
+    ] = None,
+    connection: ConnectionOption = None,
+    dsn: DsnOption = None,
+    sql: SqlOption = None,
+    file: FileOption = None,
+) -> None:
+    try:
+        if (rewrite is None) == (rewrite_file is None):
+            raise ValueError("give the new query with exactly one of --rewrite and --rewrite-file")
+        rewritten = _clean_query(
+            rewrite if rewrite is not None else _read_file(rewrite_file or Path("-"))
+        )
+        target = _target(dsn, connection, writes=True)
+        query = read_query(sql, file)
+    except (ValueError, OSError) as error:
+        raise _fail(error) from error
+    _prove(lambda: verify_rewrite(target.conninfo, query, rewritten))
+
+
+@app.command(name="top", help="The costliest SELECTs from pg_stat_statements ($n placeholders).")
 def top_command(
-    dsn: Dsn,
+    connection: ConnectionOption = None,
+    dsn: DsnOption = None,
     limit: Annotated[int, typer.Option()] = 10,
     min_calls: Annotated[int, typer.Option()] = 1,
 ) -> None:
     try:
-        rows = top_queries(dsn, limit, min_calls)
-    except (ValueError, psycopg.Error) as error:
+        rows = top_queries(_target(dsn, connection).conninfo, limit, min_calls)
+    except (ValueError, psycopg.Error, OSError) as error:
         raise _fail(error) from error
-    for row in rows:
-        query = " ".join(str(row["query"]).split())
-        typer.echo(f"{row['total_ms']} ms total, {row['calls']} calls, {row['mean_ms']} ms avg")
-        typer.echo(f"    {query}")
-    typer.echo("\nQueries show $n placeholders: substitute real values, then run `pgsage tune`.")
+    _print_json(rows)
 
 
-@app.command(name="eval", help="Score a model on cases with known fixes.")
-def eval_command(
-    dsn: Annotated[
-        str,
-        typer.Option(help="A scratch database: each case runs in a throwaway pgsage_eval_* schema"),
-    ],
-    oracle: Annotated[
-        bool, typer.Option(help="Use known-good answers to validate the harness")
-    ] = False,
-    model: Model = None,
-    provider: Provider = ProviderChoice.ANTHROPIC,
-    base_url: BaseUrl = None,
-    effort: Effort = EffortChoice.HIGH,
+@connections_app.callback(invoke_without_command=True)
+def connections_list(context: typer.Context) -> None:
+    if context.invoked_subcommand is not None:
+        return
+    try:
+        config = load_config()
+    except ConfigError as error:
+        raise _fail(error) from error
+    _print_json(
+        [
+            {
+                "name": name,
+                "target": found.describe(),
+                "default": name == config.default_connection,
+                "protected": found.protected,
+                "source": str(found.source),
+            }
+            for name, found in sorted(config.connections.items())
+        ]
+    )
+
+
+@connections_app.command(name="test", help="Connect and report who and what you reached.")
+def connections_test(
+    name: Annotated[str | None, typer.Argument(help="Connection name; default if omitted")] = None,
+    dsn: DsnOption = None,
 ) -> None:
     try:
-        shared = None if oracle else make_client(model, provider.value, base_url, effort.value)
-    except (ValueError, ExplanationError) as error:
+        target = _target(dsn, name)
+        with connect(target.conninfo) as conn:
+            conn.autocommit = True
+            version_text, user, read_only = conn.execute(
+                "SELECT version(), current_user, current_setting('transaction_read_only')"
+            ).fetchone() or ("?", "?", "?")
+            statements = conn.execute(
+                "SELECT count(*) FROM pg_extension WHERE extname = 'pg_stat_statements'"
+            ).fetchone()
+    except (ValueError, psycopg.Error, OSError) as error:
         raise _fail(error) from error
-    outcomes = run_evals(lambda case: OracleClient(case) if shared is None else shared, dsn, CASES)
-    for outcome in outcomes:
-        typer.echo(f"{'PASS' if outcome.passed else 'FAIL'}  {outcome.name}: {outcome.detail}")
-    passed = sum(o.passed for o in outcomes)
-    typer.echo(f"\n{passed}/{len(outcomes)} passed")
-    if passed != len(outcomes):
-        raise typer.Exit(1)
+    _print_json(
+        {
+            "target": target.label,
+            "user": user,
+            "version": version_text,
+            "read_only_session": read_only == "on",
+            "pg_stat_statements": bool(statements and statements[0]),
+        }
+    )
+
+
+def _write_new(path: Path, text: str, mode: int, force: bool = False, hint: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL)
+    try:
+        descriptor = os.open(path, flags, mode)
+    except FileExistsError as error:
+        raise ValueError(f"{path} already exists; {hint}") from error
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    path.chmod(mode)
+
+
+@app.command(name="init", help=f"Write a starter {PROJECT_FILE} (never overwrites).")
+def init_command(
+    user: Annotated[bool, typer.Option("--user", help="Write the user config instead")] = False,
+) -> None:
+    path = user_config_path() if user else Path.cwd() / PROJECT_FILE
+    try:
+        _write_new(path, TEMPLATE, PRIVATE_FILE, hint="edit it, or delete it to start over")
+    except (ValueError, OSError) as error:
+        raise _fail(error) from error
+    typer.echo(f"wrote {path}")
+    typer.echo("Edit it, then run: pgsage connections test")
+
+
+@app.command(
+    name="install-skill",
+    help="Install the pgsage skill so your coding agent knows how to tune a pasted query.",
+)
+def install_skill_command(
+    user: Annotated[
+        bool, typer.Option("--user", help="Install for every project (~/.claude/skills)")
+    ] = False,
+    directory: Annotated[
+        Path | None, typer.Option("--dir", help="Skills directory for another agent")
+    ] = None,
+    force: Annotated[bool, typer.Option(help="Replace an existing skill")] = False,
+) -> None:
+    root = directory or (Path.home() if user else Path.cwd()) / ".claude" / "skills"
+    path = root / SKILL_NAME / "SKILL.md"
+    try:
+        text = (files("pgsage") / "skill" / "SKILL.md").read_text(encoding="utf-8")
+        _write_new(path, text, PUBLIC_FILE, force, hint="pass --force to replace it")
+    except (ValueError, OSError) as error:
+        raise _fail(error) from error
+    typer.echo(f"wrote {path}")
