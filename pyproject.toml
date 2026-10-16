@@ -1,0 +1,65 @@
+[project]
+name = "pgsage"
+version = "0.1.0"
+description = "PostgreSQL query tuning for AI agents: your agent proposes, Postgres proves"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["postgresql", "explain", "query-tuning", "agents", "mcp", "performance"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.3.6",
+    "pydantic>=2.14.1",
+    "typer>=0.27.3",
+]
+
+[tool.uv.build-backend]
+source-include = ["LICENSE", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "SECURITY.md", "docs/**", "assets/**", "tests/**", "scripts/**", "Makefile"]
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mcp>=2.3.0",
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-github-actions-annotate-failures>=0.4.2",
+    "ruff>=0.17.0",
+    "testcontainers>=4.15.0",
+]
+
+[project.scripts]
+pgsage = "pgsage.cli:app"
+pgsage-mcp = "pgsage.mcp_main:main"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=2.3.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pyright]
+include = ["src", "tests", "scripts"]
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["docker: needs a running Docker daemon"]

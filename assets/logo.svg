@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">pgsage</title>
+  <desc id="desc">A PostgreSQL query plan tree with one branch marked as proven, and a spark for AI.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4a8bc7"/>
+      <stop offset="1" stop-color="#17375c"/>
+    </linearGradient>
+    <linearGradient id="proof" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5ff0a0"/>
+      <stop offset="1" stop-color="#19b86a"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="58" fill="url(#bg)"/>
+  <g stroke="#d6e8f8" stroke-width="9" stroke-linecap="round" fill="none" opacity="0.92">
+    <path d="M128 66 L76 126"/>
+    <path d="M128 66 L180 126"/>
+    <path d="M76 126 L46 188"/>
+    <path d="M76 126 L106 188"/>
+    <path d="M180 126 L150 188" opacity="0.45"/>
+    <path d="M180 126 L210 188" stroke="#5ff0a0"/>
+  </g>
+  <circle cx="128" cy="66" r="19" fill="#ffffff"/>
+  <circle cx="76" cy="126" r="16" fill="#ffffff"/>
+  <circle cx="180" cy="126" r="16" fill="#ffffff"/>
+  <circle cx="46" cy="188" r="14" fill="#d6e8f8" opacity="0.55"/>
+  <circle cx="106" cy="188" r="14" fill="#d6e8f8" opacity="0.55"/>
+  <circle cx="150" cy="188" r="14" fill="#d6e8f8" opacity="0.4"/>
+  <circle cx="210" cy="188" r="22" fill="url(#proof)"/>
+  <path d="M199 188 L207 196 L222 179" fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M206 28 L212 46 L230 52 L212 58 L206 76 L200 58 L182 52 L200 46 Z" fill="#ffe08a"/>
+  <path d="M232 20 L235 28 L243 31 L235 34 L232 42 L229 34 L221 31 L229 28 Z" fill="#fff3c4" opacity="0.9"/>
+</svg>
