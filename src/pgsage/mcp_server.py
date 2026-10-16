@@ -8,17 +8,19 @@ import psycopg
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from pgsage.config import resolve_target
-from pgsage.context import get_plan, table_info, top_queries
+from pgsage.config import ConfigError, resolve_target
+from pgsage.context import get_plan, server_info, table_info, top_queries
 from pgsage.db import describe_error
 from pgsage.plan import parse_explain, plan_digest
 from pgsage.verify import (
     IndexMethod,
     IndexSuggestion,
+    SettingSuggestion,
     StatisticsKind,
     StatsSuggestion,
     verify_index,
     verify_rewrite,
+    verify_setting,
     verify_statistics,
 )
 
@@ -27,7 +29,16 @@ MAX_MESSAGE_LENGTH = 500
 
 
 def _dsn(writes: bool = False) -> str:
-    return resolve_target(None, None, writes).conninfo
+    try:
+        return resolve_target(None, None, writes).conninfo
+    except ConfigError as error:
+        if str(error).startswith("no database to connect to"):
+            raise ValueError(
+                "this pgsage server has no database configured: the user must set "
+                "PGSAGE_CONNECTION (a name from pgsage.toml or the user config) or PGSAGE_DSN in "
+                "the server's environment"
+            ) from error
+        raise
 
 
 def _message(error: Exception) -> str:
@@ -55,13 +66,14 @@ Workflow:
 0. No query yet? get_top_queries lists the costliest ones (values appear as $n placeholders:
    substitute realistic literals first). Pasted an EXPLAIN (ANALYZE, FORMAT JSON) plan instead of
    a query? summarize_plan digests it without a database.
-1. get_query_plan(sql): the plan digest plus the raw plan. Start from the node with the largest
+1. get_query_plan(sql): the plan digest (add raw_plan=true for planning time, buffers, spills and
+   JIT). Start from the node with the largest
    self_ms; a misestimate (estimate_off_by of about 10 or more) or many rows removed by a filter is
    the usual cause.
 2. get_table_info(table, schema) for each table in the plan (pass `schema` for anything outside
    public): existing indexes, sizes, column statistics.
-3. Propose ONE change and prove it: verify_index_suggestion, verify_statistics_suggestion or
-   verify_query_rewrite. Each runs inside a rolled-back transaction (statistics proofs also
+3. Propose ONE change and prove it: verify_index_suggestion, verify_statistics_suggestion,
+   verify_setting_suggestion or verify_query_rewrite. Each runs inside a rolled-back transaction (statistics proofs also
    refresh row-count estimates with ANALYZE).
 4. Read `improved`. true means measured faster (at least 1.1x and 0.5 ms), the index was used,
    a statistics proof changed the plan, and a rewrite returned the same rows. false is
@@ -79,14 +91,17 @@ server = MCPServer("pgsage", instructions=INSTRUCTIONS)
 
 @server.tool()
 @_reported
-def get_query_plan(sql: str) -> dict[str, Any]:
-    """Run EXPLAIN ANALYZE on one read-only SELECT. Returns `digest` (one row per node with self_ms,
-    estimate_off_by and loops already applied: read this first) and the raw `plan`."""
-    result = get_plan(_dsn(), sql)
-    return {
-        "digest": plan_digest(result),
-        "plan": result.model_dump(by_alias=True, mode="json", exclude_none=True),
-    }
+def get_query_plan(sql: str, analyze: bool = True, raw_plan: bool = False) -> dict[str, Any]:
+    """Run EXPLAIN ANALYZE on one read-only SELECT. This EXECUTES the query (60 s limit); pass
+    analyze=false for plain EXPLAIN (estimates only, nothing runs) when the query is too slow.
+    Returns `server` (version and planner settings), `digest` (one row per node with self_ms,
+    estimate_off_by and loops already applied: read this first). Pass raw_plan=true to also get
+    the full `plan` (planning time, buffers, sort and hash details, JIT); it can be large."""
+    result = get_plan(_dsn(), sql, analyze)
+    found: dict[str, Any] = {"server": server_info(_dsn()), "digest": plan_digest(result)}
+    if raw_plan:
+        found["plan"] = result.model_dump(by_alias=True, mode="json", exclude_none=True)
+    return found
 
 
 @server.tool()
@@ -160,8 +175,26 @@ def verify_statistics_suggestion(
 
 @server.tool()
 @_reported
+def verify_setting_suggestion(sql: str, settings: dict[str, str]) -> dict[str, Any]:
+    """Measure the query with planner, memory, JIT or parallelism settings changed, for this
+    session only (set_config inside a rolled-back transaction).
+
+    Use for evidence such as spills to disk (work_mem), JIT cost (jit), an index the planner
+    avoids on fast storage (random_page_cost) or too few parallel workers. `enable_*` options are
+    for diagnosis only. Allowed: work_mem, hash_mem_multiplier, random_page_cost, seq_page_cost,
+    cpu_*_cost, effective_cache_size, jit*, max_parallel_workers_per_gather, parallel_*_cost,
+    from/join_collapse_limit, geqo, enable_*. `apply` holds session-level SET statements; making
+    a setting permanent is the user's decision.
+    """
+    suggestion = SettingSuggestion(settings=settings)
+    return verify_setting(_dsn(writes=True), sql, suggestion).as_dict()
+
+
+@server.tool()
+@_reported
 def get_top_queries(limit: int = 10) -> list[dict[str, Any]]:
-    """Most expensive SELECTs from pg_stat_statements. Values appear as $n placeholders: substitute
+    """Most expensive SELECTs from pg_stat_statements (needs the extension in
+    shared_preload_libraries and CREATE EXTENSION; otherwise this returns an error). Values appear as $n placeholders: substitute
     realistic literals before passing a query to get_query_plan."""
     return top_queries(_dsn(), limit)
 

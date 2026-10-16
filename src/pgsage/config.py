@@ -41,6 +41,8 @@ LIBPQ_PARAMS = tuple(
 TOP_LEVEL_KEYS = ("default_connection", "connections")
 VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 PROJECT_ENV_PREFIX = "PGSAGE_"
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+UNTRUSTED_FORBIDDEN = ("service", "options")
 
 TEMPLATE = """\
 default_connection = "scratch"
@@ -49,12 +51,12 @@ default_connection = "scratch"
 description = "local scratch database"
 host = "localhost"
 port = 5432
-dbname = "app"
-user = "app"
+dbname = "postgres"
+user = "postgres"
 password_env = "PGSAGE_SCRATCH_PASSWORD"
 
 # [connections.ci]
-# dsn = "${DATABASE_URL}"
+# dsn = "${PGSAGE_DATABASE_URL}"
 
 # [connections.staging-clone]
 # service = "staging_clone"
@@ -73,6 +75,7 @@ class Connection:
     password_command: tuple[str, ...] | None
     protected: bool
     source: Path
+    trusted: bool = True
 
     def conninfo(self) -> str:
         values = dict(self.values)
@@ -84,11 +87,14 @@ class Connection:
         if password is not None:
             extra["password"] = password
         try:
-            return make_conninfo(dsn, **extra)
+            conninfo = make_conninfo(dsn, **extra)
         except Exception as error:
             raise ConfigError(
                 f"connection {self.name!r}: invalid connection settings (values not shown)"
             ) from error
+        if not self.trusted:
+            _require_local(self.name, conninfo)
+        return conninfo
 
     def _password(self, password_env: str | None) -> str | None:
         if password_env:
@@ -106,10 +112,13 @@ class Connection:
         values = {**self.values}
         info: dict[str, Any] = {}
         if values.get("dsn"):
+            if VARIABLE.search(values["dsn"]):
+                return "dsn (from the environment)"
             try:
-                info = conninfo_to_dict(_expand(values["dsn"], self.name))
+                info = conninfo_to_dict(values["dsn"])
             except Exception:
                 info = {}
+            info.pop("password", None)
         info.update(
             {key: values[key] for key in ("host", "port", "dbname", "user") if key in values}
         )
@@ -183,8 +192,37 @@ def user_config_path() -> Path:
     return root / "pgsage" / "config.toml"
 
 
-def find_project_file(start: Path) -> Path | None:
+def _is_local(host: str) -> bool:
+    return host in LOCAL_HOSTS or host.startswith("/") or host.startswith("127.")
+
+
+def _require_local(name: str, conninfo: str) -> None:
+    try:
+        host = str(conninfo_to_dict(conninfo).get("host") or "")
+    except Exception as error:
+        raise ConfigError(f"connection {name!r}: invalid connection settings") from error
+    if not host or not all(_is_local(part) for part in host.split(",")):
+        raise ConfigError(
+            f"connection {name!r}: a project file may only name a local host (localhost, "
+            "127.0.0.1, ::1 or a socket directory); define remote connections in your user "
+            f"config ({user_config_path()})"
+        )
+
+
+def _search_directories(start: Path) -> list[Path]:
+    directories: list[Path] = []
     for directory in (start, *start.parents):
+        directories.append(directory)
+        if (directory / ".git").exists():
+            return directories
+    return [start]
+
+
+def find_project_file(start: Path) -> Path | None:
+    home = Path.home()
+    for directory in _search_directories(start):
+        if directory == home:
+            continue
         candidate = directory / PROJECT_FILE
         if candidate.is_file():
             return candidate
@@ -214,6 +252,33 @@ def _as_table(value: object, where: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{where} must be a table")
     return {str(k): v for k, v in cast("dict[Any, Any]", value).items()}
+
+
+def _check_project_values(where: str, values: dict[str, str]) -> None:
+    for key in UNTRUSTED_FORBIDDEN:
+        if key in values:
+            raise ConfigError(
+                f"{where}: {key} is not allowed in a project file; use your user config "
+                f"({user_config_path()})"
+            )
+    if "host" in values and not VARIABLE.search(values["host"]):
+        if not all(_is_local(part) for part in values["host"].split(",")):
+            raise ConfigError(
+                f"{where}: a project file may only name a local host (localhost, 127.0.0.1, ::1 "
+                f"or a socket directory); define remote connections in your user config "
+                f"({user_config_path()})"
+            )
+    dsn = values.get("dsn")
+    if dsn and not VARIABLE.search(dsn):
+        try:
+            parsed = conninfo_to_dict(dsn)
+        except Exception as error:
+            raise ConfigError(f"{where}: invalid dsn (value not shown)") from error
+        if "password" in parsed:
+            raise ConfigError(
+                f"{where}: a password inside dsn is not allowed; use password_env or .pgpass"
+            )
+        _require_local(where, dsn)
 
 
 def _check_project_env(where: str, values: dict[str, str]) -> None:
@@ -258,10 +323,11 @@ def _connection(name: str, raw: object, path: Path, trusted: bool) -> Connection
         parsed = tuple(str(part) for part in parts)
     if not trusted:
         _check_project_env(where, values)
+        _check_project_values(where, values)
     protected = table.get("protected", False)
     if not isinstance(protected, bool):
         raise ConfigError(f"{where}.protected must be true or false")
-    return Connection(name, values, parsed, protected, path)
+    return Connection(name, values, parsed, protected, path, trusted)
 
 
 def _load_file(path: Path, trusted: bool) -> Config:
@@ -275,10 +341,10 @@ def _load_file(path: Path, trusted: bool) -> Config:
     return Config(connections, default, (path,))
 
 
-def _merge(base: Config, over: Config) -> Config:
+def _merge(base: Config, over: Config, project_default_allowed: bool = True) -> Config:
     return Config(
         {**base.connections, **over.connections},
-        over.default_connection or base.default_connection,
+        base.default_connection or (over.default_connection if project_default_allowed else None),
         (*base.files, *over.files),
     )
 
@@ -303,7 +369,7 @@ def load_config(cwd: Path | None = None) -> Config:
                 f"{project}: connection(s) {', '.join(shadowed)} are already defined in your "
                 "user config; a project file cannot redefine them, so rename them"
             )
-        config = _merge(config, loaded)
+        config = _merge(config, loaded, project_default_allowed=config.default_connection is None)
     return config
 
 

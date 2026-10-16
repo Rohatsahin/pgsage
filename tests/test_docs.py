@@ -54,7 +54,7 @@ def test_readme_shows_the_logo_and_it_exists() -> None:
     assert svg.startswith("<svg") and "<title" in svg
 
 
-COMMANDS = ("inspect", "verify", "top", "connections", "init", "install-skill")
+COMMANDS = ("inspect", "summarize", "verify", "top", "connections", "init", "install-skill")
 
 
 def test_readme_command_table_matches_the_real_cli() -> None:
@@ -119,6 +119,7 @@ def test_skill_mentions_every_mcp_tool_and_every_cli_command() -> None:
         "pgsage inspect",
         "pgsage verify index",
         "pgsage verify statistics",
+        "pgsage verify setting",
         "pgsage verify rewrite",
         "pgsage top",
         "pgsage connections",

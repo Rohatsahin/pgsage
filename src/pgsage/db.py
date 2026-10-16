@@ -33,11 +33,14 @@ def connect_dicts(dsn: str) -> psycopg.Connection[dict[str, Any]]:
 def describe_error(error: Exception) -> str:
     if isinstance(error, psycopg.Error):
         text = error.diag.message_primary or (str(error).splitlines() or [""])[0]
+        if "resolve host" in text or "translate host name" in text:
+            text = "could not resolve the database host; check the host in the connection settings"
         message = f"{type(error).__name__}: {text}"
     elif isinstance(error, ValidationError):
         first = error.errors()[0]
         where = ".".join(str(part) for part in first["loc"])
-        message = f"{where}: {first['msg']}" if where else str(first["msg"])
+        text = str(first["msg"]).removeprefix("Value error, ")
+        message = f"{where}: {text}" if where else text
     else:
         message = (str(error).splitlines() or [""])[0] or type(error).__name__
     return message[:MAX_MESSAGE_LENGTH]

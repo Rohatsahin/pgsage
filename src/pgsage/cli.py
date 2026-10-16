@@ -27,10 +27,12 @@ from pgsage.plan import parse_explain, plan_digest
 from pgsage.verify import (
     IndexMethod,
     IndexSuggestion,
+    SettingSuggestion,
     StatsSuggestion,
     VerifyResult,
     verify_index,
     verify_rewrite,
+    verify_setting,
     verify_statistics,
 )
 
@@ -43,7 +45,9 @@ app = typer.Typer(
 verify_app = typer.Typer(
     help="Prove a change: apply it, measure it, roll it back.", no_args_is_help=True
 )
-connections_app = typer.Typer(help="Named database connections")
+connections_app = typer.Typer(
+    help="Named database connections. Without a subcommand, lists them (as JSON)."
+)
 app.add_typer(verify_app, name="verify")
 app.add_typer(connections_app, name="connections")
 
@@ -180,10 +184,18 @@ def inspect_command(
     sql: SqlOption = None,
     file: FileOption = None,
     raw_plan: Annotated[bool, typer.Option(help="Also include the raw EXPLAIN plan")] = False,
+    analyze: Annotated[
+        bool,
+        typer.Option(
+            "--analyze/--no-analyze",
+            help="--no-analyze runs plain EXPLAIN: estimates only, the query is not executed "
+            "(for queries slower than 60 s)",
+        ),
+    ] = True,
 ) -> None:
     try:
         target = _target(dsn, connection)
-        _print_json(inspect_query(target.conninfo, read_query(sql, file), raw_plan))
+        _print_json(inspect_query(target.conninfo, read_query(sql, file), raw_plan, analyze))
     except (ValueError, psycopg.Error, OSError) as error:
         raise _fail(error) from error
 
@@ -207,11 +219,11 @@ def summarize_command(
 
 @verify_app.command(name="index", help="Prove an index. Exit 1 if it is not proven.")
 def verify_index_command(
-    table: Annotated[str, typer.Option()],
+    table: Annotated[str, typer.Option(help="Bare table name, as in tables[].name")],
     columns: Annotated[str, typer.Option(help="Comma-separated key columns")],
     connection: ConnectionOption = None,
     dsn: DsnOption = None,
-    schema: Annotated[str | None, typer.Option()] = None,
+    schema: Annotated[str | None, typer.Option(help="Schema, from tables[].schema")] = None,
     method: Annotated[IndexMethod, typer.Option(help="btree, hash, gin or brin")] = "btree",
     include: Annotated[str, typer.Option(help="Comma-separated covering columns")] = "",
     where: Annotated[str | None, typer.Option(help="Partial index predicate")] = None,
@@ -236,12 +248,15 @@ def verify_index_command(
 
 @verify_app.command(name="statistics", help="Prove extended statistics. Exit 1 if not proven.")
 def verify_statistics_command(
-    table: Annotated[str, typer.Option()],
+    table: Annotated[str, typer.Option(help="Bare table name, as in tables[].name")],
     columns: Annotated[str, typer.Option(help="Comma-separated columns (at least two)")],
     connection: ConnectionOption = None,
     dsn: DsnOption = None,
-    schema: Annotated[str | None, typer.Option()] = None,
-    kinds: Annotated[str, typer.Option(help="dependencies, ndistinct, mcv (comma-separated)")] = "",
+    schema: Annotated[str | None, typer.Option(help="Schema, from tables[].schema")] = None,
+    kinds: Annotated[
+        str,
+        typer.Option(help="dependencies, ndistinct, mcv, comma-separated (default: first two)"),
+    ] = "",
     sql: SqlOption = None,
     file: FileOption = None,
 ) -> None:
@@ -257,7 +272,38 @@ def verify_statistics_command(
     _prove(lambda: verify_statistics(target.conninfo, query, suggestion))
 
 
-@verify_app.command(name="rewrite", help="Prove a rewrite returns the same rows, faster.")
+@verify_app.command(
+    name="setting",
+    help="Prove a settings change (work_mem, jit, random_page_cost, ...) for this session "
+    "only. Exit 1 if not proven.",
+)
+def verify_setting_command(
+    set_: Annotated[
+        list[str], typer.Option("--set", help="name=value, e.g. work_mem=64MB (repeat up to 5)")
+    ],
+    connection: ConnectionOption = None,
+    dsn: DsnOption = None,
+    sql: SqlOption = None,
+    file: FileOption = None,
+) -> None:
+    try:
+        settings: dict[str, str] = {}
+        for item in set_:
+            name, separator, value = item.partition("=")
+            if not separator:
+                raise ValueError(f"--set expects name=value, got {item!r}")
+            settings[name.strip()] = value.strip()
+        suggestion = SettingSuggestion(settings=settings)
+        target = _target(dsn, connection, writes=True)
+        query = read_query(sql, file)
+    except (ValueError, OSError) as error:
+        raise _fail(error) from error
+    _prove(lambda: verify_setting(target.conninfo, query, suggestion))
+
+
+@verify_app.command(
+    name="rewrite", help="Prove a rewrite returns the same rows, faster. Exit 1 if not proven."
+)
 def verify_rewrite_command(
     rewrite: Annotated[str | None, typer.Option(help="The rewritten SELECT")] = None,
     rewrite_file: Annotated[
@@ -285,8 +331,8 @@ def verify_rewrite_command(
 def top_command(
     connection: ConnectionOption = None,
     dsn: DsnOption = None,
-    limit: Annotated[int, typer.Option()] = 10,
-    min_calls: Annotated[int, typer.Option()] = 1,
+    limit: Annotated[int, typer.Option(help="How many queries to list (at most 100)")] = 10,
+    min_calls: Annotated[int, typer.Option(help="Ignore queries called fewer times")] = 1,
 ) -> None:
     try:
         rows = top_queries(_target(dsn, connection).conninfo, limit, min_calls)
@@ -320,12 +366,15 @@ def connections_list(context: typer.Context) -> None:
 @connections_app.command(name="test", help="Connect and report who and what you reached.")
 def connections_test(
     name: Annotated[str | None, typer.Argument(help="Connection name; default if omitted")] = None,
+    connection: ConnectionOption = None,
     dsn: DsnOption = None,
 ) -> None:
     try:
-        target = _target(dsn, name)
+        target = _target(dsn, name or connection)
         with connect(target.conninfo) as conn:
             conn.autocommit = True
+            conn.execute("SET statement_timeout = '10s'")
+            conn.execute("SET lock_timeout = '5s'")
             version_text, user, read_only = conn.execute(
                 "SELECT version(), current_user, current_setting('transaction_read_only')"
             ).fetchone() or ("?", "?", "?")
@@ -347,14 +396,19 @@ def connections_test(
 
 def _write_new(path: Path, text: str, mode: int, force: bool = False, hint: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL)
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_TRUNC if force else os.O_EXCL
     try:
         descriptor = os.open(path, flags, mode)
     except FileExistsError as error:
         raise ValueError(f"{path} already exists; {hint}") from error
+    except OSError as error:
+        if path.is_symlink():
+            raise ValueError(f"{path} is a symbolic link; refusing to write through it") from error
+        raise
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), mode)
         handle.write(text)
-    path.chmod(mode)
 
 
 @app.command(name="init", help=f"Write a starter {PROJECT_FILE} (never overwrites).")
@@ -368,6 +422,10 @@ def init_command(
         raise _fail(error) from error
     typer.echo(f"wrote {path}")
     typer.echo("Edit it, then run: pgsage connections test")
+    try:
+        load_config()
+    except ConfigError as error:
+        typer.echo(f"warning: {error}", err=True)
 
 
 @app.command(
@@ -386,6 +444,8 @@ def install_skill_command(
     root = directory or (Path.home() if user else Path.cwd()) / ".claude" / "skills"
     path = root / SKILL_NAME / "SKILL.md"
     try:
+        if directory is not None and user:
+            raise ValueError("use either --dir or --user, not both")
         text = (files("pgsage") / "skill" / "SKILL.md").read_text(encoding="utf-8")
         _write_new(path, text, PUBLIC_FILE, force, hint="pass --force to replace it")
     except (ValueError, OSError) as error:

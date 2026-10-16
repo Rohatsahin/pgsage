@@ -23,6 +23,7 @@ class PlanNode(BaseModel):
     actual_total_time: float | None = Field(default=None, alias="Actual Total Time")
     rows_removed_by_filter: float | None = Field(default=None, alias="Rows Removed by Filter")
     workers_launched: int | None = Field(default=None, alias="Workers Launched")
+    subplan_name: str | None = Field(default=None, alias="Subplan Name")
     children: list[PlanNode] = Field(default_factory=lambda: list[PlanNode](), alias="Plans")
     in_parallel: bool = Field(default=False, exclude=True)
     parallel_participants: int = Field(default=1, exclude=True)
@@ -97,9 +98,22 @@ class ExplainResult(BaseModel):
         return self
 
 
+def _load_json(raw: str) -> object:
+    try:
+        return json.loads(raw)
+    except RecursionError as error:
+        raise ValueError("the plan nests too deeply to parse") from error
+    except ValueError:
+        opening = min((i for i in (raw.find("["), raw.find("{")) if i != -1), default=-1)
+        closing = max(raw.rfind("]"), raw.rfind("}"))
+        if opening == -1 or closing <= opening:
+            raise
+        return json.loads(raw[opening : closing + 1])
+
+
 def parse_explain(raw: str | list[Any] | dict[str, Any]) -> ExplainResult:
     try:
-        data: object = json.loads(raw) if isinstance(raw, str) else raw
+        data: object = _load_json(raw) if isinstance(raw, str) else raw
     except ValueError as error:
         raise ValueError(
             "the plan is not JSON; use EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)"
@@ -128,24 +142,25 @@ def plan_digest(result: ExplainResult) -> list[dict[str, Any]]:
 
     def visit(node: PlanNode, depth: int) -> None:
         ratio = node.row_estimate_ratio
-        digest.append(
-            {
-                "depth": depth,
-                "node": node.node_type,
-                "relation": node.relation_name,
-                "index": node.index_name,
-                "planned_rows": node.plan_rows,
-                "actual_rows_total": node.total_actual_rows,
-                "loops": node.loops,
-                "self_ms": None if node.self_time is None else round(node.self_time, 3),
-                "rows_removed_by_filter": (
-                    None
-                    if node.rows_removed_by_filter is None
-                    else node.rows_removed_by_filter * node.loops
-                ),
-                "estimate_off_by": None if ratio is None else round(max(ratio, 1 / ratio), 1),
-            }
-        )
+        row: dict[str, Any] = {
+            "depth": depth,
+            "node": node.node_type,
+            "relation": node.relation_name,
+            "index": node.index_name,
+            "planned_rows": node.plan_rows,
+            "actual_rows_total": node.total_actual_rows,
+            "loops": node.loops,
+            "self_ms": None if node.self_time is None else round(node.self_time, 3),
+            "rows_removed_by_filter": (
+                None
+                if node.rows_removed_by_filter is None
+                else node.rows_removed_by_filter * node.loops
+            ),
+            "estimate_off_by": None if ratio is None else round(max(ratio, 1 / ratio), 1),
+        }
+        if node.subplan_name:
+            row["subplan"] = node.subplan_name
+        digest.append(row)
         for child in node.children:
             visit(child, depth + 1)
 

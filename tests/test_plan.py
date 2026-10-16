@@ -262,3 +262,41 @@ def test_parses_real_join_with_children(pg_conn: psycopg.Connection) -> None:
 def test_parses_plain_explain(pg_conn: psycopg.Connection) -> None:
     raw = explain_json(pg_conn, "SELECT * FROM orders", analyze=False)
     assert not parse_explain(raw).analyzed
+
+
+def test_a_plan_pasted_from_psql_with_its_header_still_parses() -> None:
+    pasted = (
+        "                 QUERY PLAN\n"
+        "------------------------------------------\n"
+        " [                                        +\n"
+        "   {                                      +\n"
+        '     "Plan": {"Node Type": "Result", "Total Cost": 0.01, "Plan Rows": 1}+\n'
+        "   }                                      +\n"
+        " ]\n"
+        "(1 row)\n"
+    ).replace("+\n", "\n")
+    assert parse_explain(pasted).plan.node_type == "Result"
+
+
+def test_the_digest_marks_subplan_nodes() -> None:
+    plan = [
+        {
+            "Plan": {
+                "Node Type": "Seq Scan",
+                "Total Cost": 1.0,
+                "Plan Rows": 1,
+                "Plans": [
+                    {
+                        "Node Type": "Index Scan",
+                        "Parent Relationship": "SubPlan",
+                        "Subplan Name": "SubPlan 1",
+                        "Total Cost": 1.0,
+                        "Plan Rows": 1,
+                    }
+                ],
+            }
+        }
+    ]
+    rows = plan_digest(parse_explain(plan))
+    assert "subplan" not in rows[0]
+    assert rows[1]["subplan"] == "SubPlan 1"

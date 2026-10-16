@@ -237,3 +237,66 @@ def test_an_e_prefix_only_counts_at_a_token_start() -> None:
 def test_the_predicate_validator_fails_closed_too(predicate: str) -> None:
     with pytest.raises(ValueError):
         ensure_safe_predicate(predicate)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1 AS a$b$, pg_sleep(0.1) AS c$b$",
+        "SELECT 1 AS a$b$, set_config('statement_timeout', '0', true) AS c$b$",
+        "SELECT 1 AS é$b$, pg_terminate_backend(1) AS c$b$",
+        "SELECT pg_catalog.\"set_config\"('statement_timeout', '0', true)",
+        'SELECT "pg_sleep"(1)',
+        "SELECT \"dblink_exec\"('x', 'y')",
+        'SELECT "pg_catalog"."pg_terminate_backend"(1)',
+        'SELECT U&"pg\\005fsleep"(1)',
+        "SELECT U&'abc'",
+        "SELECT 1 FROM t WHERE a = E'x' AND pg_sleep(1) IS NULL",
+    ],
+)
+def test_the_gate_sees_through_identifier_tricks(sql: str) -> None:
+    with pytest.raises(UnsafeStatementError):
+        ensure_read_only(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'SELECT "pg_sleep" FROM t',
+        'SELECT "my col" FROM "my table" WHERE "a$b$" = 1',
+        "SELECT 1 AS a$b$, 2 AS c$b$",
+        "SELECT 'pg_sleep(1)', $$set_config(1)$$ FROM t",
+    ],
+)
+def test_the_gate_still_accepts_harmless_look_alikes(sql: str) -> None:
+    ensure_read_only(sql)
+
+
+ADVERSARIAL_INPUTS = {
+    "unterminated comments": lambda: "SELECT 1 /* " * 40_000,
+    "distinct dollar tags": lambda: "SELECT 1 " + " ".join(f"$t{i}$" for i in range(60_000)),
+    "repeated dollar tag": lambda: "SELECT 1 " + "$a$ " * 100_000,
+    "non-ascii dollar tags": lambda: "SELECT 1 " + "$\U0001f600$ x " * 50_000,
+    "mixed openers": lambda: "SELECT 1 /* $a$ '' " * 30_000,
+    "quotes": lambda: "SELECT " + "'a" * 200_000,
+    "escape-string prefixes": lambda: "SELECT " + 'E"' * 200_000,
+    "parentheses": lambda: "SELECT (" * 100_000,
+}
+
+
+@pytest.mark.parametrize("name", list(ADVERSARIAL_INPUTS))
+def test_the_lexer_is_linear_on_adversarial_input(name: str) -> None:
+    import time
+
+    sql = ADVERSARIAL_INPUTS[name]()
+    started = time.monotonic()
+    try:
+        ensure_read_only(sql)
+    except UnsafeStatementError:
+        pass
+    assert time.monotonic() - started < 2.0
+
+
+def test_a_very_long_query_is_refused_before_it_is_scanned() -> None:
+    with pytest.raises(UnsafeStatementError, match="longer than"):
+        ensure_read_only("SELECT " + "1," * 600_000 + "1")

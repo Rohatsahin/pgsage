@@ -4,6 +4,7 @@ from typing import Any
 import psycopg
 import pytest
 from psycopg.conninfo import make_conninfo
+from psycopg.sql import SQL, Identifier
 
 from pgsage import context as context_module
 from pgsage import plan_digest
@@ -11,6 +12,7 @@ from pgsage.context import (
     collect_tables,
     get_plan,
     inspect_query,
+    server_info,
     table_ancestors,
     table_info,
     tables_in_plan,
@@ -207,16 +209,16 @@ def test_collect_tables_keeps_same_named_tables_of_different_schemas_apart(
 def test_a_table_the_catalog_cannot_describe_is_skipped_not_fatal(
     pg_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def missing(dsn: str, table: str, schema: str = "public") -> dict[str, Any]:
+    def missing(conn: object, schema: str, table: str) -> dict[str, Any]:
         raise ValueError(f"table {schema}.{table} not found")
 
-    monkeypatch.setattr(context_module, "table_info", missing)
+    monkeypatch.setattr(context_module, "_table_facts", missing)
     assert collect_tables(pg_dsn, [("public", "orders")]) == []
 
 
 def test_inspect_query_returns_digest_tables_and_optionally_the_raw_plan(pg_dsn: str) -> None:
     found = inspect_query(pg_dsn, QUERY)
-    assert found["query"] == QUERY
+    assert "query" not in found
     assert found["baseline_ms"] is not None
     assert found["digest"][0]["node"] == "Seq Scan"
     assert found["tables"][0]["name"] == "orders"
@@ -227,3 +229,74 @@ def test_inspect_query_returns_digest_tables_and_optionally_the_raw_plan(pg_dsn:
 def test_inspect_query_refuses_anything_but_a_read_only_select(pg_dsn: str) -> None:
     with pytest.raises(ValueError):
         inspect_query(pg_dsn, "DELETE FROM orders")
+
+
+def test_server_info_reports_version_settings_and_changed_planner_options(
+    pg_dsn: str,
+) -> None:
+    info = server_info(pg_dsn)
+    assert info["version"].startswith("17")
+    assert info["settings"]["work_mem"].endswith("kB")
+    assert {"jit", "random_page_cost", "default_statistics_target"} <= set(info["settings"])
+    assert info["planner_options_changed"] == {}
+
+
+def test_server_info_lists_an_enable_option_that_differs_from_the_default(
+    pg_dsn: str,
+) -> None:
+    with psycopg.connect(pg_dsn, autocommit=True) as conn:
+        database = conn.execute("SELECT current_database()").fetchone()
+        assert database is not None
+        name = Identifier(database[0])
+        conn.execute(SQL("ALTER DATABASE {} SET enable_seqscan = off").format(name))
+        try:
+            info = server_info(pg_dsn)
+        finally:
+            conn.execute(SQL("ALTER DATABASE {} RESET enable_seqscan").format(name))
+    assert info["planner_options_changed"] == {"enable_seqscan": "off"}
+
+
+def test_table_info_reports_pages_visibility_and_maintenance(pg_dsn: str) -> None:
+    info = table_info(pg_dsn, "orders")
+    assert info["size"]["pages"] > 0
+    assert "all_visible_pages" in info["size"]
+    assert {"last_analyze", "n_dead_tup", "n_mod_since_analyze"} <= set(info["maintenance"])
+
+
+def test_inspect_output_is_bounded(pg_dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(context_module, "MAX_DIGEST_ROWS", 1)
+    monkeypatch.setattr(context_module, "MAX_COLUMNS", 1)
+    monkeypatch.setattr(context_module, "MAX_TABLES", 1)
+    found = inspect_query(
+        pg_dsn, "SELECT o.id FROM orders o JOIN orders p ON p.id = o.id WHERE o.customer_id = 3"
+    )
+    assert len(found["digest"]) == 1
+    assert found["digest_rows_omitted"] >= 1
+    table = found["tables"][0]
+    assert len(table["columns"]) == 1 and table["columns_omitted"] >= 1
+    assert len(found["tables"]) == 1
+
+
+def test_collecting_tables_uses_one_connection(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened: list[str] = []
+    real = context_module.connect_dicts
+
+    def counting(dsn: str) -> Any:
+        opened.append(dsn)
+        return real(dsn)
+
+    monkeypatch.setattr(context_module, "connect_dicts", counting)
+    collect_tables(pg_dsn, [("public", "orders"), ("public", "orders")])
+    assert len(opened) == 1
+
+
+def test_top_queries_truncate_long_statements(stats_dsn: str) -> None:
+    import psycopg
+
+    long_query = "SELECT count(*) FROM t WHERE id > 0 " + "AND id > 0 " * 600
+    with psycopg.connect(stats_dsn, autocommit=True) as conn:
+        conn.execute(long_query)  # pyright: ignore[reportArgumentType]
+    rows = top_queries(stats_dsn, 100)
+    assert all(len(row["query"]) <= 2000 for row in rows)

@@ -38,7 +38,8 @@ It never overwrites an existing skill unless you pass `--force`.
    (columns, indexes, sizes, `column_stats`). Read the node with the largest `self_ms`, then
    `estimate_off_by` (about 10 or more is a real misestimate) and `rows_removed_by_filter`.
 3. **Propose one change** from what the evidence shows.
-4. **Prove it.** `pgsage verify index`, `verify statistics` or `verify rewrite`. Read `improved`.
+4. **Prove it.** `pgsage verify index`, `verify statistics`, `verify setting` or `verify rewrite`. Read
+   `improved`.
 5. **`improved: false` is information.** Read `error`, `note`, `equivalent` and
    `after.uses_new_index`, then try something different or stop. Never report a change as helpful
    unless `improved` is true.
@@ -60,8 +61,8 @@ pgsage verify statistics --table addresses --columns city,zip --kinds dependenci
   precious `protected = true`.
 - **Query input:** `--sql`, `--file` (`-` for stdin), or piped stdin. Never interactive: with none
   of them and a terminal for stdin, the command fails with a message instead of waiting.
-- **Output:** one JSON document on stdout. Messages (such as `using connection scratch (...)`) go
-  to stderr, so stdout is always parseable.
+- **Output:** commands that query the database print one JSON document on stdout. Messages (such
+  as `using connection scratch (...)`) go to stderr, so stdout is parseable.
 - **Exit codes:** `0` it ran (and, for `verify`, the change is proven); `1` `verify` ran but the
   change is not proven (the JSON still explains why); `2` bad input, bad config, or a database
   error (`error: ...` on stderr).

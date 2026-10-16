@@ -24,8 +24,9 @@
 Asking an AI "why is this query slow?" gives you confident prose that is often wrong: indexes the
 planner ignores, rewrites that quietly change the results, advice that does nothing. Your agent
 is good at reading a plan and proposing a fix. It cannot tell whether the fix works. pgsage can:
-it applies each proposal inside a transaction that is rolled back (statistics proofs aside, see below), times the query before and
-after, and returns a verdict.
+it applies each proposal inside a transaction that is rolled back, times the query before and
+after, and returns a verdict. (One exception: a statistics proof runs `ANALYZE`, which refreshes
+the table's row-count estimates for good; see "Safety, briefly".)
 
 ```text
 you paste a slow query
@@ -49,27 +50,45 @@ you paste a slow query
 
 ## Quick start
 
+Try it on a throwaway database in about two minutes:
+
 ```bash
-pip install 'pgsage[mcp]'
+docker run -d --rm --name pgsage-demo -p 5432:5432 -e POSTGRES_PASSWORD=pw postgres:17
+docker exec pgsage-demo psql -U postgres -c "CREATE TABLE orders AS SELECT g AS id, g % 1000 AS customer_id, 'status' || (g % 5) AS status, now() - (g || ' minutes')::interval AS created_at FROM generate_series(1, 300000) g; ANALYZE orders"
 
-pgsage init                     # writes a starter pgsage.toml; edit the connection
-pgsage connections test         # check you can reach it
+pip install 'pgsage[mcp]'                 # from a clone: pip install '.[mcp]'
+export PGSAGE_SCRATCH_PASSWORD=pw
+pgsage init                               # writes pgsage.toml (postgres on localhost:5432)
+pgsage connections test                   # check you can reach it
 
-pgsage install-skill            # teach your agent (Claude Code: .claude/skills/pgsage)
-claude mcp add pgsage -e PGSAGE_CONNECTION=scratch -e PGSAGE_SCRATCH_PASSWORD -- pgsage-mcp   # optional: MCP tools
+pgsage inspect --sql "SELECT * FROM orders WHERE customer_id = 7"
+pgsage verify index --table orders --columns customer_id --sql "SELECT * FROM orders WHERE customer_id = 7"
 ```
 
-Then paste a slow query to your agent and ask why it is slow. Use a **scratch or dev database**:
-the tools run `EXPLAIN ANALYZE`, which executes the query.
+Then wire it to your agent, so you can just paste a slow query and ask why it is slow:
+
+```bash
+pgsage install-skill      # teaches the agent (Claude Code: .claude/skills/pgsage); --dir for others
+claude mcp add pgsage -e PGSAGE_CONNECTION=scratch -- pgsage-mcp     # optional: MCP tools
+```
+
+Keep the password out of the agent's configuration: leave `password_env` out of the connection and
+put the password in `~/.pgpass` (libpq reads it), or use `password_command` in your user config
+(`pgsage init --user`). `pgsage-mcp` must be on the `PATH` that your agent sees; a virtualenv or
+pipx install usually is not, so give the full path.
+
+Use a **scratch or dev database**: the tools run `EXPLAIN ANALYZE`, which executes the query, and
+proofs create indexes (see "Safety, briefly" for the role you need).
 
 The skill and the MCP server do the same job; use either or both. An agent with only a shell
 uses the commands directly, which is how the transcript below was produced.
 
 ### Shell or MCP
 
-An agent with a shell calls the `pgsage` commands below. An agent with MCP gets seven tools that
+An agent with a shell calls the `pgsage` commands below. An agent with MCP gets eight tools that
 do the same work: `get_top_queries`, `get_query_plan`, `summarize_plan`, `get_table_info`,
-`verify_index_suggestion`, `verify_statistics_suggestion` and `verify_query_rewrite`. The database
+`verify_index_suggestion`, `verify_statistics_suggestion`, `verify_setting_suggestion` and
+`verify_query_rewrite`. The database
 is fixed in the server's environment; no tool accepts a connection string. Details:
 [docs/agents.md](docs/agents.md) and [docs/mcp.md](docs/mcp.md).
 
@@ -108,6 +127,7 @@ proposes one and proves it with `pgsage verify index --table orders --columns cu
             "uses_new_index": true},
   "apply": ["CREATE INDEX CONCURRENTLY IF NOT EXISTS \"idx_orders_customer_id_status\" ON \"orders\" (\"customer_id\", \"status\");"],
   "improved": true,
+  "reason": null,
   "speedup": 68.87
 }
 ```
@@ -117,15 +137,18 @@ Agent: *"`orders` is scanned in full and almost every row is discarded. An index
 To apply it: `CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`. It will also add cost to every write
 on `orders`."*
 
-That output is from a real run on a 300,000-row table; timings vary with your machine and data.
-A change that does not help comes back with `"improved": false` and the reason, and the agent
-tries something else.
+The two JSON blocks are from a real run on a 300,000-row table (shortened), and the agent's reply
+is illustrative. `baseline_ms` is one cold run of the query; `before` and `after` are the best of
+three runs, which is why they differ. Timings vary with your machine and data. A change that does
+not help comes back with `"improved": false` and a `reason`, and the agent tries something else.
 
 ### Connections
 
 Name your databases once instead of pasting connection strings. `pgsage.toml` (found by walking
 up from the current directory, so it can live in the repo) and `~/.config/pgsage/config.toml`
-(yours alone) both work; the project file overrides yours by name.
+(yours alone) both work. The project file is searched from the current directory up to the
+repository root (never your home directory) and can only add connections: it cannot redefine a
+connection from your user config.
 
 ```toml
 default_connection = "scratch"
@@ -157,8 +180,10 @@ so `~/.pg_service.conf` and `~/.pgpass` work as usual.
   `dsn`, a `.pgpass` file, or `password_command = ["op", "read", "op://vault/db/password"]`.
   `password_command` runs a program (no shell), so it is only honored in your own user config,
   never in a project file you may have just cloned. For the same reason a project file may only
-  read environment variables that start with `PGSAGE_`, and it cannot redefine a connection your
-  user config already defines.
+  name a local host (`localhost`, `127.0.0.1`, `::1` or a socket directory), may only read
+  environment variables that start with `PGSAGE_`, cannot set `service` or `options`, cannot hold
+  a password inside a `dsn`, and cannot change your default connection. Anything remote belongs in
+  your user config.
 - **`protected = true`** marks a database where pgsage must never create indexes or run your
   query to prove a change. The `verify` commands and tools refuse it; `inspect` and `top` still
   work, and `inspect` does run the query (`EXPLAIN ANALYZE`). Only named connections can be
@@ -169,22 +194,35 @@ so `~/.pg_service.conf` and `~/.pgpass` work as usual.
 
 ## Commands
 
-Every command prints one JSON document on stdout; messages go to stderr; failures print
-`error: ...` and exit 2.
+Commands that query the database print one JSON document on stdout; messages go to stderr;
+failures print `error: ...` and exit 2 (a usage mistake gets the argument parser's own message,
+also exit 2).
 
 | Command | What it does |
 | --- | --- |
-| `pgsage inspect` | plan digest, baseline time and table facts for a `SELECT` (`--raw-plan` adds the raw plan) |
+| `pgsage inspect` | plan digest, server settings and table facts for a `SELECT` (`--raw-plan` adds the raw plan; `--no-analyze` estimates without running the query) |
+| `pgsage summarize` | the digest of an `EXPLAIN (ANALYZE, FORMAT JSON)` plan you already have; no database needed |
 | `pgsage verify index` | prove an index (`--method`, `--include`, `--where`); exit 1 if not proven |
 | `pgsage verify statistics` | prove extended statistics (`--kinds`); exit 1 if not proven |
+| `pgsage verify setting` | prove a settings change for this session only (`--set work_mem=64MB`, `jit=off`, ...); exit 1 if not proven |
 | `pgsage verify rewrite` | prove a rewritten `SELECT` returns the same rows, faster (`--rewrite` or `--rewrite-file`); exit 1 if not proven |
 | `pgsage top` | the costliest `SELECT`s from `pg_stat_statements` (values appear as `$n`) |
-| `pgsage connections` / `connections test` | list named connections; connect and report who and what you reached |
+| `pgsage connections` / `connections test` | list named connections; connect and report who and what you reached (`connections test NAME` or `-c NAME`) |
 | `pgsage init` | write a starter `pgsage.toml` (never overwrites) |
 | `pgsage install-skill` | install the skill for your agent (`--user` for every project, `--dir` for another agent) |
 
 The query comes from `--sql`, `--file` (`-` for stdin) or piped stdin; nothing ever prompts.
 Every database command takes `-c/--connection NAME` or `--dsn`.
+
+## Good fit, not a fit
+
+- **A good fit:** a slow `SELECT` on a PostgreSQL scratch or staging copy, where you want an index,
+  a rewrite, extended statistics or a settings change that is measured before anyone recommends it.
+- **Not a fit:** writes (`INSERT`, `UPDATE`, `DELETE`), non-PostgreSQL databases, queries that run
+  longer than about 10 s (each proof runs the query six times under a 60 s limit; use
+  `inspect --no-analyze` to diagnose from estimates), or measuring the write cost of an index.
+- **Limits you should know:** only PostgreSQL 17 is tested; a speedup is for one machine, one
+  dataset and one moment; a rewrite is compared on the current data, not proven for all data.
 
 ## What "proven" means
 
@@ -192,7 +230,8 @@ Every database command takes `-c/--connection NAME` or `--dsn`.
 | --- | --- |
 | index (btree, partial, covering, gin, brin, hash) | the new plan uses it and is at least 1.1x and 0.5 ms faster (partitioned parents work) |
 | rewrite | same column names, types and precision, same rows (in order if there is a top-level `ORDER BY`), and faster in interleaved runs; a rewrite identical to the original is not a proof |
-| extended statistics | at least 1.1x and 0.5 ms faster, with `ANALYZE` run on both sides |
+| extended statistics | at least 1.1x and 0.5 ms faster **and** a changed plan, with `ANALYZE` run on both sides; the weakest proof, and often not proven |
+| setting | at least 1.1x and 0.5 ms faster with the value applied to this session only; the plan does not have to change and nothing about results is compared |
 
 Rewrites that cannot be compared (volatile functions, `LIMIT` without `ORDER BY`) are never
 proven. A proposal that fails on the database comes back as not proven with the error, so the
@@ -202,7 +241,9 @@ must run outside a transaction block).
 
 ## Safety, briefly
 
-The real boundary is the database role: **use a least-privilege role on a scratch database.**
+The real boundary is the database role: **use a dedicated role on a scratch copy of the data.**
+`CREATE INDEX` needs table ownership, so the role must own the tables it proves against (not an
+application or superuser role; see [docs/security.md](docs/security.md)).
 On top of that, pgsage accepts one read-only statement, runs every measurement in a read-only
 transaction with timeouts, quotes all identifiers, has PostgreSQL itself refuse any second
 statement, and never takes a connection string from a tool call. Your agent sees what the tools

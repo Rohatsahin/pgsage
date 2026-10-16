@@ -43,7 +43,9 @@ def isolated_config(
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
-    monkeypatch.chdir(home)
+    workdir = home / "work"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
     for name in ("PGSAGE_CONFIG", "PGSAGE_CONNECTION"):
         monkeypatch.delenv(name, raising=False)
     for name in ("PGSERVICE", "PGHOST", "PGHOSTADDR", "PGDATABASE", "PGUSER", "PGPASSWORD"):

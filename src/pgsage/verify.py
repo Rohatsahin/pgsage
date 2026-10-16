@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from pgsage.db import connect, describe_error
 from pgsage.plan import ExplainResult, parse_explain
-from pgsage.sqlscan import is_ambiguous, mask, quote_ident, substitute
+from pgsage.sqlscan import is_ambiguous, mask, mask_keeping_names, quote_ident, substitute
 
 READ_ONLY_START = re.compile(r"^[\s(]*(select|with|values|table)\b", re.IGNORECASE)
 FORBIDDEN_KEYWORDS = re.compile(
@@ -35,8 +35,15 @@ VOLATILE_FUNCTIONS = re.compile(
 ORDER_BY = re.compile(r"\border\s+by\b", re.IGNORECASE)
 ROW_LIMIT = re.compile(r"\b(limit|offset|fetch)\b", re.IGNORECASE)
 PLACEHOLDER = re.compile(r"\$\d+")
+UNICODE_ESCAPE = re.compile(r"(?<![\w$])[uU]&\s*(?:''|\"\")")
+MAX_SQL_CHARS = 1_000_000
 
 MAX_IDENTIFIER_BYTES = 63
+LOCK_NOTE = "could not get a lock within 5 s: another session holds a conflicting lock on the table"
+SETTING_NOTE = (
+    "measured with the setting applied to this session only; making it permanent (ALTER ROLE or "
+    "ALTER DATABASE ... SET, or postgresql.conf) is a separate decision that affects every query"
+)
 TIMEOUT_NOTE = (
     "a statement timed out (60 s limit); a proof runs the query several times, so use a query "
     "that finishes in a few seconds"
@@ -45,14 +52,14 @@ PARTITIONED_NOTE = (
     "partitioned table: CREATE INDEX CONCURRENTLY is not supported on the parent, so the apply "
     "SQL builds the index without it (writes are blocked while it runs)"
 )
-DATA_ERROR_CLASSES = ("22", "42")
+DATA_ERROR_CLASSES = ("22", "42", "54")
 MIN_SPEEDUP = 1.1
 MIN_ABSOLUTE_GAIN_MS = 0.5
 MEASURE_RUNS = 3
 STATEMENT_TIMEOUT = "60s"
 LOCK_TIMEOUT = "5s"
 
-ChangeKind = Literal["index", "rewrite", "statistics"]
+ChangeKind = Literal["index", "rewrite", "statistics", "setting"]
 
 
 def _identifier_part(value: str) -> str:
@@ -101,6 +108,73 @@ class _TargetSuggestion(BaseModel):
 
 
 IndexMethod = Literal["btree", "hash", "gin", "brin"]
+
+SETTING_NAME = re.compile(
+    r"^(work_mem|hash_mem_multiplier|random_page_cost|seq_page_cost|cpu_tuple_cost|"
+    r"cpu_index_tuple_cost|cpu_operator_cost|effective_cache_size|jit|jit_above_cost|"
+    r"jit_inline_above_cost|jit_optimize_above_cost|max_parallel_workers_per_gather|"
+    r"parallel_setup_cost|parallel_tuple_cost|from_collapse_limit|join_collapse_limit|geqo|"
+    r"enable_[a-z_]+)$"
+)
+SETTING_VALUE = re.compile(r"^[A-Za-z0-9_.]{1,32}$")
+MAX_SETTINGS = 5
+
+
+SETTING_LIMITS = {
+    "hash_mem_multiplier": 100.0,
+    "from_collapse_limit": 100.0,
+    "join_collapse_limit": 100.0,
+    "max_parallel_workers_per_gather": 64.0,
+}
+WORK_MEM_LIMIT_KB = 4 * 1024 * 1024
+MEMORY_UNITS_KB = {"kb": 1, "mb": 1024, "gb": 1024 * 1024, "tb": 1024 * 1024 * 1024}
+MEMORY_VALUE = re.compile(r"(\d+)([A-Za-z]*)")
+
+
+def _check_setting_range(name: str, value: str) -> None:
+    if name == "work_mem":
+        found = MEMORY_VALUE.fullmatch(value)
+        unit = (found.group(2) if found else "kB").lower() or "kb"
+        if found is None or unit not in MEMORY_UNITS_KB:
+            raise ValueError("work_mem must look like 64MB")
+        if int(found.group(1)) * MEMORY_UNITS_KB[unit] > WORK_MEM_LIMIT_KB:
+            raise ValueError("work_mem above 4GB is not allowed here")
+    limit = SETTING_LIMITS.get(name)
+    if limit is not None:
+        try:
+            number = float(value)
+        except ValueError:
+            return
+        if number > limit:
+            raise ValueError(f"{name} above {limit:g} is not allowed here")
+
+
+class SettingSuggestion(BaseModel):
+    settings: dict[str, str] = Field(min_length=1, max_length=MAX_SETTINGS)
+
+    @field_validator("settings")
+    @classmethod
+    def _allowed(cls, value: dict[str, str]) -> dict[str, str]:
+        for name, setting in value.items():
+            if not SETTING_NAME.fullmatch(name):
+                raise ValueError(
+                    f"{name!r} cannot be proven: only planner, memory, JIT and parallelism "
+                    "settings are allowed"
+                )
+            if not SETTING_VALUE.fullmatch(setting):
+                raise ValueError(f"the value for {name} must be a plain word or number like 64MB")
+            _check_setting_range(name, setting)
+        return value
+
+    @property
+    def statement(self) -> str:
+        return "SET " + ", ".join(f"{name} = '{value}'" for name, value in self.settings.items())
+
+    @property
+    def apply_sql(self) -> list[str]:
+        return [f"SET {name} = '{value}';" for name, value in self.settings.items()]
+
+
 MAX_PREDICATE_LENGTH = 500
 
 
@@ -129,7 +203,11 @@ def ensure_safe_predicate(predicate: str) -> None:
         reason = "multiple statements are not allowed"
     elif re.search(r"\bselect\b", core, re.IGNORECASE):
         reason = "subqueries are not allowed"
-    elif (found := FORBIDDEN_KEYWORDS.search(core)) or (found := FORBIDDEN_FUNCTIONS.search(core)):
+    elif UNICODE_ESCAPE.search(core):
+        reason = "unicode-escape identifiers and strings (U&) are not supported"
+    elif (found := FORBIDDEN_KEYWORDS.search(core)) or (
+        found := FORBIDDEN_FUNCTIONS.search(mask_keeping_names(predicate))
+    ):
         reason = f"`{found.group(0).strip()}` is not allowed"
     if reason:
         raise ValueError(f"unsafe partial index predicate: {reason}")
@@ -256,11 +334,31 @@ class VerifyResult(BaseModel):
             return None
         return self.before.execution_ms / self.after.execution_ms
 
+    @property
+    def reason(self) -> str | None:
+        if self.improved or self.error is not None:
+            return None
+        if self.equivalent is False:
+            return self.note or "the results differ"
+        if self.kind == "index" and not self.after.uses_new_index:
+            return "the planner did not use the new index"
+        if self.kind == "statistics" and self.before.node_types == self.after.node_types:
+            return "the plan did not change"
+        speedup = self.speedup
+        if speedup is not None and self.before.execution_ms and self.after.execution_ms:
+            gain = self.before.execution_ms - self.after.execution_ms
+            return (
+                f"{speedup:.2f}x and {gain:.2f} ms is below the {MIN_SPEEDUP}x and "
+                f"{MIN_ABSOLUTE_GAIN_MS} ms floor"
+            )
+        return "the plan cost did not drop"
+
     def as_dict(self) -> dict[str, Any]:
         speedup = self.speedup
         return {
             **self.model_dump(mode="json"),
             "improved": self.improved,
+            "reason": self.reason,
             "speedup": None if speedup is None else round(speedup, 2),
             "apply": self.apply if self.improved else [],
         }
@@ -285,6 +383,8 @@ class UnsafeStatementError(ValueError):
 
 
 def ensure_read_only(sql: str) -> None:
+    if len(sql) > MAX_SQL_CHARS:
+        raise UnsafeStatementError(f"the query is longer than {MAX_SQL_CHARS:,} characters")
     core = mask(sql).strip().rstrip(";").strip()
     reason = None
     if is_ambiguous(sql):
@@ -295,11 +395,17 @@ def ensure_read_only(sql: str) -> None:
         reason = "remove the EXPLAIN keyword; pgsage runs EXPLAIN ANALYZE itself"
     elif not READ_ONLY_START.match(core):
         reason = "only SELECT/WITH/VALUES/TABLE statements are allowed"
-    elif (found := FORBIDDEN_KEYWORDS.search(core)) or (found := FORBIDDEN_FUNCTIONS.search(core)):
+    elif UNICODE_ESCAPE.search(core):
+        reason = "unicode-escape identifiers and strings (U&) are not supported"
+    elif (found := FORBIDDEN_KEYWORDS.search(core)) or (
+        found := FORBIDDEN_FUNCTIONS.search(mask_keeping_names(sql))
+    ):
         reason = f"`{found.group(0).strip()}` is not allowed"
     if reason:
+        if reason.startswith("remove the EXPLAIN"):
+            raise UnsafeStatementError(reason)
         raise UnsafeStatementError(
-            f"{reason}: verify runs the statement with EXPLAIN ANALYZE, so it must be a single "
+            f"{reason}: pgsage runs the statement with EXPLAIN ANALYZE, so it must be a single "
             "read-only query"
         )
 
@@ -321,8 +427,10 @@ def run_single(conn: psycopg.Connection[Any], query: SQL | Composed) -> psycopg.
     return conn.execute(query, prepare=True)
 
 
-def run_explain(conn: psycopg.Connection[Any], sql: str) -> ExplainResult:
-    statement = SQL("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) {}").format(literal(sql))
+def run_explain(conn: psycopg.Connection[Any], sql: str, analyze: bool = True) -> ExplainResult:
+    begin_guarded(conn)
+    options = "ANALYZE, BUFFERS, VERBOSE, FORMAT JSON" if analyze else "VERBOSE, FORMAT JSON"
+    statement = SQL("EXPLAIN ({}) {}").format(SQL(options), literal(sql))
     row = run_single(conn, statement).fetchone()
     if row is None:
         raise RuntimeError("EXPLAIN returned no rows")
@@ -393,7 +501,7 @@ def top_level(masked: str) -> str:
 def unprovable_reason(sql: str) -> str | None:
     core = mask(sql)
     top = top_level(core)
-    if VOLATILE_FUNCTIONS.search(core):
+    if VOLATILE_FUNCTIONS.search(mask_keeping_names(sql)):
         return "the query calls a volatile function, so its results cannot be compared"
     if ROW_LIMIT.search(top) and not ORDER_BY.search(top):
         return "LIMIT/OFFSET/FETCH without a top-level ORDER BY returns an arbitrary subset"
@@ -423,7 +531,7 @@ def _results_equivalent(
     if _columns(conn, original) != _columns(conn, rewritten):
         return False, "result columns (names, types or precision) differ"
     if ORDER_BY.search(top_level(mask(original))):
-        ordered = SQL("SELECT md5(coalesce(string_agg(r, E'\\n'), '')) FROM ({}) AS s")
+        ordered = SQL("SELECT md5(coalesce(string_agg(md5(r), ''), '')) FROM ({}) AS s")
         hashes = [
             run_single(conn, ordered.format(_as_text(q))).fetchone() for q in (original, rewritten)
         ]
@@ -502,6 +610,8 @@ def _failed_on_data_error(
         return run()
     except psycopg.errors.QueryCanceled:
         return VerifyResult.failed(kind, statement, TIMEOUT_NOTE)
+    except psycopg.errors.LockNotAvailable:
+        return VerifyResult.failed(kind, statement, LOCK_NOTE)
     except psycopg.Error as error:
         if not (error.sqlstate or "").startswith(DATA_ERROR_CLASSES):
             raise
@@ -510,11 +620,42 @@ def _failed_on_data_error(
 
 def _is_partitioned(dsn: str, suggestion: IndexSuggestion) -> bool:
     with connect(dsn) as conn:
+        begin_guarded(conn)
         row = conn.execute(
             "SELECT relkind FROM pg_class WHERE oid = to_regclass(%s)",
             (suggestion.qualified_table,),
         ).fetchone()
     return bool(row and row[0] == "p")
+
+
+COVERING_INDEX_SQL = """
+SELECT i.relname
+FROM pg_index x
+JOIN pg_class i ON i.oid = x.indexrelid
+JOIN pg_class t ON t.oid = x.indrelid
+JOIN pg_am am ON am.oid = i.relam
+WHERE t.oid = to_regclass(%s)
+  AND x.indisvalid AND x.indpred IS NULL AND x.indexprs IS NULL
+  AND am.amname = %s
+  AND (
+      SELECT array_agg(a.attname::text ORDER BY k.ord)
+      FROM unnest(x.indkey[0:%s]) WITH ORDINALITY AS k(attnum, ord)
+      JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+  ) = %s::text[]
+LIMIT 1
+"""
+
+
+def _covering_index(dsn: str, suggestion: IndexSuggestion) -> str | None:
+    if suggestion.where is not None:
+        return None
+    width = len(suggestion.columns)
+    with connect(dsn) as conn:
+        row = conn.execute(
+            COVERING_INDEX_SQL,
+            (suggestion.qualified_table, suggestion.method, width - 1, suggestion.columns),
+        ).fetchone()
+    return None if row is None else str(row[0])
 
 
 def verify_index(dsn: str, sql: str, suggestion: IndexSuggestion) -> VerifyResult:
@@ -525,6 +666,13 @@ def verify_index(dsn: str, sql: str, suggestion: IndexSuggestion) -> VerifyResul
         return [row[0] for row in conn.execute(FAMILY_SQL, (index_name,)).fetchall()]
 
     def run() -> VerifyResult:
+        existing = _covering_index(dsn, suggestion)
+        if existing is not None:
+            return VerifyResult.failed(
+                "index",
+                suggestion.ddl,
+                f"the index {existing} already covers these columns; a new index is not needed",
+            )
         result = _experiment(dsn, sql, "index", suggestion.ddl, change)
         partitioned = _is_partitioned(dsn, suggestion)
         update: dict[str, Any] = {"apply": index_apply_sql(suggestion, not partitioned)}
@@ -533,6 +681,20 @@ def verify_index(dsn: str, sql: str, suggestion: IndexSuggestion) -> VerifyResul
         return result.model_copy(update=update)
 
     return _failed_on_data_error("index", suggestion.ddl, run)
+
+
+def verify_setting(dsn: str, sql: str, suggestion: SettingSuggestion) -> VerifyResult:
+    def change(conn: psycopg.Connection[Any]) -> None:
+        for name, value in suggestion.settings.items():
+            conn.execute("SELECT set_config(%s, %s, true)", (name, value))
+
+    def run() -> VerifyResult:
+        result = _experiment(dsn, sql, "setting", suggestion.statement, change)
+        return result.model_copy(
+            update={"apply": suggestion.apply_sql, "note": result.note or SETTING_NOTE}
+        )
+
+    return _failed_on_data_error("setting", suggestion.statement, run)
 
 
 def verify_statistics(dsn: str, sql: str, suggestion: StatsSuggestion) -> VerifyResult:

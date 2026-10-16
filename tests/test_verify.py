@@ -405,13 +405,25 @@ def test_every_proof_transaction_gets_timeouts(
 ) -> None:
     spy = Spy(monkeypatch, verify_module)
     verify_index(pg_dsn, QUERY, IndexSuggestion(table="orders", columns=["customer_id"]))
-    assert spy.calls == 2
+    assert spy.calls >= 2
     spy.calls = 0
     verify_statistics(pg_dsn, QUERY, StatsSuggestion(table="orders", columns=["customer_id", "id"]))
-    assert spy.calls == 2
+    assert spy.calls >= 2
     spy.calls = 0
     verify_rewrite(pg_dsn, QUERY, QUERY + " AND id > 0")
-    assert spy.calls == 1
+    assert spy.calls >= 1
+
+
+def test_the_timeouts_are_restored_before_every_measured_statement(pg_dsn: str) -> None:
+    with psycopg.connect(pg_dsn) as conn:
+        conn.execute("SET LOCAL statement_timeout = 0")
+        conn.execute("SET LOCAL lock_timeout = 0")
+        verify_module.run_explain(conn, "SELECT 1 AS a")
+        timeout = conn.execute("SHOW statement_timeout").fetchone()
+        lock = conn.execute("SHOW lock_timeout").fetchone()
+        conn.rollback()
+    assert timeout is not None and timeout[0] == "1min"
+    assert lock is not None and lock[0] == "5s"
 
 
 def test_an_identical_rewrite_is_not_a_proof(pg_dsn: str) -> None:
@@ -732,3 +744,137 @@ def test_a_statement_timeout_is_an_unproven_result_not_a_crash(
     result = verify_rewrite(pg_dsn, "SELECT 1 AS a", "SELECT 2 AS a")
     assert not result.improved
     assert result.error is not None and "timed out" in result.error
+
+
+def test_a_setting_suggestion_accepts_only_planner_memory_jit_and_parallel_settings() -> None:
+    suggestion = verify_module.SettingSuggestion(settings={"work_mem": "64MB", "jit": "off"})
+    assert suggestion.apply_sql == ["SET work_mem = '64MB';", "SET jit = 'off';"]
+    assert suggestion.statement == "SET work_mem = '64MB', jit = 'off'"
+    for bad in ("statement_timeout", "search_path", "session_replication_role", "enable_x; DROP"):
+        with pytest.raises(ValueError, match="cannot be proven"):
+            verify_module.SettingSuggestion(settings={bad: "1"})
+    for value in ("64MB'; DROP TABLE t; --", "", "a b", "x" * 40):
+        with pytest.raises(ValueError, match="plain word or number"):
+            verify_module.SettingSuggestion(settings={"work_mem": value})
+    with pytest.raises(ValueError):
+        verify_module.SettingSuggestion(settings={})
+
+
+def test_a_setting_proof_measures_with_the_value_applied_and_leaves_nothing_behind(
+    pg_dsn: str, pg_conn: psycopg.Connection
+) -> None:
+    result = verify_module.verify_setting(
+        pg_dsn,
+        "SELECT g FROM generate_series(1, 300000) g ORDER BY g DESC",
+        verify_module.SettingSuggestion(settings={"work_mem": "512MB"}),
+    )
+    assert result.error is None
+    assert result.kind == "setting"
+    assert result.apply == ["SET work_mem = '512MB';"]
+    assert result.note is not None and "this session only" in result.note
+    row = pg_conn.execute("SHOW work_mem").fetchone()
+    assert row is not None and row[0] != "512MB"
+
+
+def test_a_setting_proof_with_an_unknown_value_is_an_unproven_result(pg_dsn: str) -> None:
+    result = verify_module.verify_setting(
+        pg_dsn, "SELECT 1 AS a", verify_module.SettingSuggestion(settings={"jit": "maybe"})
+    )
+    assert not result.improved and result.error
+
+
+def test_every_unproven_verdict_carries_a_reason() -> None:
+    def result(kind: verify_module.ChangeKind, before: Any, after: Any, **extra: Any) -> Any:
+        return verify_module.VerifyResult(
+            kind=kind, statement="s", before=before, after=after, **extra
+        )
+
+    slow = plan_shape(["Seq Scan"], 10.0)
+    barely = plan_shape(["Seq Scan"], 9.8)
+    unused = result("index", slow, barely)
+    assert unused.reason == "the planner did not use the new index"
+    same_plan = result("statistics", slow, barely)
+    assert same_plan.reason == "the plan did not change"
+    below = result("setting", slow, barely)
+    assert below.reason is not None and "below the 1.1x and 0.5 ms floor" in below.reason
+    differs = result("rewrite", slow, barely, equivalent=False, note="result rows differ")
+    assert differs.reason == "result rows differ"
+    assert result("rewrite", slow, plan_shape(["Index Scan"], 1.0), equivalent=True).reason is None
+    assert below.as_dict()["reason"] == below.reason
+
+
+def test_an_index_that_already_exists_is_reported_not_re_proven(
+    pg_dsn: str, pg_conn: psycopg.Connection
+) -> None:
+    pg_conn.execute("CREATE INDEX covering_probe ON orders (customer_id, id)")
+    try:
+        prefix = verify_index(
+            pg_dsn,
+            "SELECT * FROM orders WHERE customer_id = 5",
+            IndexSuggestion(table="orders", columns=["customer_id"]),
+        )
+        wider = verify_index(
+            pg_dsn,
+            "SELECT * FROM orders WHERE customer_id = 5",
+            IndexSuggestion(table="orders", columns=["customer_id", "id", "created_at"]),
+        )
+    finally:
+        pg_conn.execute("DROP INDEX covering_probe")
+    assert prefix.error is not None and "covering_probe" in prefix.error
+    assert not prefix.improved
+    assert wider.error is None or "covering_probe" not in wider.error
+
+
+def test_a_partial_index_is_never_mistaken_for_an_existing_equivalent(
+    pg_dsn: str, pg_conn: psycopg.Connection
+) -> None:
+    pg_conn.execute("CREATE INDEX partial_probe ON orders (customer_id) WHERE id > 10")
+    try:
+        result = verify_index(
+            pg_dsn,
+            "SELECT * FROM orders WHERE customer_id = 5",
+            IndexSuggestion(table="orders", columns=["customer_id"]),
+        )
+    finally:
+        pg_conn.execute("DROP INDEX partial_probe")
+    assert result.error is None
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"work_mem": "64MB\n"},
+        {"work_mem": "9999GB"},
+        {"work_mem": "5000000"},
+        {"hash_mem_multiplier": "1000"},
+        {"max_parallel_workers_per_gather": "500"},
+        {"join_collapse_limit": "1000000"},
+        {"work_mem\n": "1MB"},
+    ],
+)
+def test_a_setting_proof_rejects_unbounded_or_sloppy_values(settings: dict[str, str]) -> None:
+    with pytest.raises(ValueError):
+        verify_module.SettingSuggestion(settings=settings)
+
+
+def test_a_setting_proof_accepts_sensible_values() -> None:
+    suggestion = verify_module.SettingSuggestion(
+        settings={
+            "work_mem": "256MB",
+            "hash_mem_multiplier": "4",
+            "random_page_cost": "1.1",
+            "jit": "off",
+        }
+    )
+    assert len(suggestion.apply_sql) == 4
+
+
+def test_an_ordered_rewrite_is_compared_per_row_so_the_result_never_needs_one_huge_string(
+    pg_dsn: str,
+) -> None:
+    result = verify_rewrite(
+        pg_dsn,
+        "SELECT id FROM orders WHERE id < 2000 ORDER BY id",
+        "SELECT id FROM orders WHERE id < 2000 ORDER BY id, customer_id",
+    )
+    assert result.error is None and result.equivalent is True

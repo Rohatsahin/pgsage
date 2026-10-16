@@ -166,3 +166,25 @@ async def test_a_protected_connection_refuses_the_tools_that_run_ddl(
         ("verify_query_rewrite", {"sql": QUERY, "rewritten_sql": QUERY + " "}),
     ):
         assert "protected" in await error_text(tool, arguments)
+
+
+@pytest.mark.anyio
+async def test_a_missing_database_gives_instructions_an_mcp_agent_can_follow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PGSAGE_DSN")
+    text = await error_text("get_query_plan", {"sql": QUERY})
+    assert "PGSAGE_CONNECTION" in text
+    assert "--connection" not in text
+
+
+@pytest.mark.anyio
+async def test_get_query_plan_can_skip_execution() -> None:
+    async with Client(server) as client:
+        result = await client.call_tool("get_query_plan", {"sql": QUERY, "analyze": False})
+    assert not result.is_error
+    first = result.content[0]
+    assert isinstance(first, TextContent)
+    found = json.loads(first.text)
+    assert found["digest"][0]["self_ms"] is None
+    assert "server" in found

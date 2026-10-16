@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from psycopg.conninfo import conninfo_to_dict
 from typer.testing import CliRunner
 
 from pgsage.cli import MAX_QUERY_BYTES, app, read_query
+from pgsage.config import user_config_path
 
 QUERY = "SELECT *\nFROM orders\nWHERE customer_id = 7"
 
@@ -31,6 +33,12 @@ def pipe(monkeypatch: pytest.MonkeyPatch, data: bytes, tty: bool = False) -> Non
 
 def write_project(body: str) -> None:
     Path("pgsage.toml").write_text(body)
+
+
+def write_user_config(body: str) -> None:
+    path = user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
 
 
 def run(*args: str, input: str | None = None) -> Any:
@@ -158,13 +166,15 @@ def test_inspect_can_include_the_raw_plan(pg_dsn: str) -> None:
 
 def test_inspect_reads_a_multiline_query_from_stdin(pg_dsn: str) -> None:
     found = payload(run("inspect", "--dsn", pg_dsn, input=QUERY))
-    assert found["query"] == QUERY
+    assert found["tables"][0]["name"] == "orders"
+    assert "query" not in found
 
 
 def test_inspect_reads_a_query_file(pg_dsn: str, tmp_path: Path) -> None:
     path = tmp_path / "q.sql"
     path.write_text(QUERY)
-    assert payload(run("inspect", "--dsn", pg_dsn, "--file", str(path)))["query"] == QUERY
+    found = payload(run("inspect", "--dsn", pg_dsn, "--file", str(path)))
+    assert found["tables"][0]["name"] == "orders"
 
 
 def test_inspect_rejects_writes_with_a_friendly_error(pg_dsn: str) -> None:
@@ -357,7 +367,7 @@ def test_dsn_and_connection_together_fail_cleanly() -> None:
 
 
 def test_a_named_connection_reports_itself_on_stderr_only(pg_dsn: str) -> None:
-    write_project(f'default_connection = "scratch"\n[connections.scratch]\ndsn = "{pg_dsn}"\n')
+    write_user_config(f'default_connection = "scratch"\n[connections.scratch]\ndsn = "{pg_dsn}"\n')
     result = run("inspect", "--sql", QUERY)
     assert result.exit_code == 0, result.stderr
     assert "using connection scratch" in result.stderr
@@ -365,7 +375,7 @@ def test_a_named_connection_reports_itself_on_stderr_only(pg_dsn: str) -> None:
 
 
 def test_protected_connections_refuse_every_proof(pg_dsn: str) -> None:
-    write_project(f'[connections.prod]\ndsn = "{pg_dsn}"\nprotected = true\n')
+    write_user_config(f'[connections.prod]\ndsn = "{pg_dsn}"\nprotected = true\n')
     attempts = (
         ["verify", "index", "--table", "orders", "--columns", "id", "--sql", QUERY],
         [
@@ -381,7 +391,7 @@ def test_protected_connections_refuse_every_proof(pg_dsn: str) -> None:
 
 
 def test_protected_connections_still_allow_inspect_and_top(stats_dsn: str) -> None:
-    write_project(f'[connections.prod]\ndsn = "{stats_dsn}"\nprotected = true\n')
+    write_user_config(f'[connections.prod]\ndsn = "{stats_dsn}"\nprotected = true\n')
     assert run("inspect", "-c", "prod", "--sql", "SELECT * FROM t WHERE id = 5").exit_code == 0
     assert run("top", "-c", "prod").exit_code == 0
 
@@ -409,12 +419,12 @@ def test_connections_lists_nothing_as_an_empty_json_list() -> None:
 
 def test_connections_json_lists_machine_readable_entries() -> None:
     write_project(
-        'default_connection = "a"\n[connections.a]\nhost = "ha"\nuser = "u"\ndbname = "d"\n'
+        'default_connection = "a"\n[connections.a]\nhost = "localhost"\nuser = "u"\ndbname = "d"\n'
         "protected = true\n"
     )
     (entry,) = payload(run("connections"))
     assert entry["name"] == "a" and entry["default"] and entry["protected"]
-    assert entry["target"] == "u@ha:5432/d"
+    assert entry["target"] == "u@localhost:5432/d"
     assert entry["source"].endswith("pgsage.toml")
 
 
@@ -539,3 +549,124 @@ def test_a_malformed_connection_string_is_not_echoed() -> None:
     result = run("inspect", "--dsn", "postgres://u:p%zzsecret@h/db", "--sql", "SELECT 1")
     assert result.exit_code == 2
     assert "secret" not in result.stderr and "secret" not in result.stdout
+
+
+def test_verify_setting_reports_a_session_only_proof(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "setting", "--dsn", pg_dsn, "--set", "work_mem=512MB", "--set", "jit=off"),
+        *("--sql", "SELECT g FROM generate_series(1, 200000) g ORDER BY g DESC"),
+    )
+    verdict = payload(result)
+    assert verdict["kind"] == "setting"
+    assert verdict["error"] is None
+    assert "SET work_mem = '512MB';" in verdict["apply"] or not verdict["improved"]
+
+
+def test_verify_setting_rejects_a_setting_that_is_not_allowed(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "setting", "--dsn", pg_dsn, "--set", "statement_timeout=0"),
+        *("--sql", "SELECT 1"),
+    )
+    assert result.exit_code == 2
+    assert "cannot be proven" in result.stderr
+
+
+def test_verify_setting_needs_name_equals_value(pg_dsn: str) -> None:
+    result = run(
+        *("verify", "setting", "--dsn", pg_dsn, "--set", "work_mem"), *("--sql", "SELECT 1")
+    )
+    assert result.exit_code == 2
+    assert "name=value" in result.stderr
+
+
+def test_inspect_without_analyze_estimates_and_does_not_run_the_query(pg_dsn: str) -> None:
+    result = run(
+        *("inspect", "--dsn", pg_dsn, "--no-analyze"),
+        *("--sql", "SELECT count(*) FROM orders, orders o2 WHERE orders.id = o2.id"),
+    )
+    found = payload(result)
+    assert found["baseline_ms"] is None
+    assert all(row["self_ms"] is None for row in found["digest"])
+    assert found["digest"][0]["planned_rows"] >= 1
+
+
+def test_a_query_over_the_time_limit_explains_the_way_out(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import psycopg
+
+    from pgsage import context
+
+    def cancelled(*args: object, **kwargs: object) -> None:
+        raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(context, "run_explain", cancelled)
+    result = run("inspect", "--dsn", pg_dsn, "--sql", "SELECT 1")
+    assert result.exit_code == 2
+    assert "--no-analyze" in result.stderr
+
+
+def test_top_hides_pgsages_own_queries(stats_dsn: str) -> None:
+    run(
+        *("verify", "rewrite", "--dsn", stats_dsn, "--sql", "SELECT id FROM t WHERE id < 5"),
+        *("--rewrite", "SELECT id FROM t WHERE id < 5 AND id > 0"),
+    )
+    run("inspect", "--dsn", stats_dsn, "--sql", "SELECT id FROM t WHERE id < 5")
+    rows = payload(run("top", "--dsn", stats_dsn, "--limit", "100"))
+    text = " ".join(row["query"] for row in rows)
+    for own in ("EXCEPT ALL", "pg_settings", "pg_stat_user_tables", "AS q LIMIT 0"):
+        assert own not in text
+    assert all(isinstance(row["total_ms"], float) for row in rows)
+
+
+def test_connections_test_accepts_the_connection_flag_too(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    info = conninfo_to_dict(pg_dsn)
+    (Path.cwd() / "pgsage.toml").write_text(
+        f'[connections.here]\nhost = "{info["host"]}"\nport = {info["port"]}\n'
+        f'dbname = "{info["dbname"]}"\nuser = "{info["user"]}"\n'
+        'password_env = "PGSAGE_TEST_PASSWORD"\n'
+    )
+    monkeypatch.setenv("PGSAGE_TEST_PASSWORD", str(info["password"]))
+    flagged = payload(run("connections", "test", "-c", "here"))
+    positional = payload(run("connections", "test", "here"))
+    assert flagged["user"] == positional["user"]
+
+
+def test_install_skill_rejects_dir_together_with_user(tmp_path: Path) -> None:
+    result = run("install-skill", "--user", "--dir", str(tmp_path))
+    assert result.exit_code == 2
+    assert "either --dir or --user" in result.stderr
+
+
+def test_a_rejected_setting_message_does_not_leak_validation_internals() -> None:
+    result = run("verify", "setting", "--dsn", "host=x", "--set", "foo=1", "--sql", "SELECT 1")
+    assert result.exit_code == 2
+    assert "Value error" not in result.stderr and "cannot be proven" in result.stderr
+
+
+def test_install_skill_never_writes_through_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "precious.txt"
+    target.write_text("keep me")
+    target.chmod(0o600)
+    skills = tmp_path / "skills" / "pgsage"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").symlink_to(target)
+    forced = run("install-skill", "--dir", str(tmp_path / "skills"), "--force")
+    assert forced.exit_code == 2
+    assert "symbolic link" in forced.stderr
+    assert target.read_text() == "keep me"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_a_resolution_failure_does_not_echo_part_of_the_connection_string() -> None:
+    result = run(
+        "inspect",
+        "--dsn",
+        "postgresql://app:HUNTERpw@xx@nonexistent.invalid:5432/d",
+        "--sql",
+        "SELECT 1",
+    )
+    assert result.exit_code == 2
+    assert "HUNTER" not in result.stderr and "xx@" not in result.stderr

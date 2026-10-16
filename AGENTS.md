@@ -81,8 +81,11 @@ These exist because an external review found real exploits. Each has regression 
    Do not add a `dsn` parameter to a tool.
 5. **`protected` connections are never proven against.** `verify` commands and the MCP verify
    tools refuse a connection marked `protected = true`.
-6. **`password_command` runs a program, so it is honored only from the user config**, never from a
-   project `pgsage.toml`, and it is run without a shell. A plaintext `password` key is rejected.
+6. **A project `pgsage.toml` is untrusted.** `password_command` is honored only from the user
+   config and runs without a shell; a plaintext `password` key is rejected. A project file may only
+   name a local host, read `PGSAGE_*` environment variables, and add (never redefine) connections;
+   it cannot set `service`, `options`, a password in a `dsn`, or the default connection. Connection
+   labels never show expanded environment values.
 7. **An unproven change is never reported as proven.** `VerifyResult.improved` requires: no
    error, equivalence not false, the new index (or one of its partition children) actually used
    (for indexes), and a measured speedup of at least 1.1x **and** 0.5 ms. A rewrite identical to
