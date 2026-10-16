@@ -75,7 +75,7 @@ Workflow:
 3. Propose ONE change and prove it: verify_index_suggestion, verify_statistics_suggestion,
    verify_setting_suggestion or verify_query_rewrite. Each runs inside a rolled-back transaction (statistics proofs also
    refresh row-count estimates with ANALYZE).
-4. Read `improved`. true means measured faster (at least 1.1x and 0.5 ms), the index was used,
+4. Read `improved`. true means measured faster (at least 0.5 ms and 1.1x, higher when the timings are noisy), the index was used,
    a statistics proof changed the plan, and a rewrite returned the same rows. false is
    information: read `error`, `note` and `equivalent`, then try a different idea or stop. An
    `error` about a missing table or column means the call was wrong, not the idea. Never report a

@@ -41,9 +41,12 @@ Every statement that carries caller-influenced text is executed with the extende
 gate (`ensure_read_only`) is a second layer, not the only one.
 
 `VerifyResult.improved` is true only if there is no error, the result is equivalent (or not
-applicable), the new index is used (indexes), and the change is at least 1.1x **and** 0.5 ms
-faster. A statistics proof also needs a changed plan (`node_types`). The absolute floor keeps a microsecond
-query that "improves" by 18x from being called a win.
+applicable), the new index is used (indexes), and the change is at least 0.5 ms **and** at least
+`max(1.1, 1 + 3 x noise)` times faster, where `noise` is how far the second-fastest run is from the
+fastest. A statistics proof also needs a changed plan (`node_types`), compared against two plain
+`ANALYZE` runs so that sampling noise alone cannot pass; a pass under 1.3x is repeated and must
+pass twice. The absolute floor keeps a microsecond query that "improves" by 18x from being called
+a win.
 
 Rewrites are compared on column names, types and numeric precision, then on rows as text
 (`EXCEPT ALL` both ways, or an ordered hash when the query has a top-level `ORDER BY`; an
@@ -84,8 +87,11 @@ partition parents, and `table_info` reads columns, indexes, size and `pg_stats`.
 - **JSON on stdout, messages on stderr.** An agent can parse every result without scraping.
 - **A digest next to the raw plan**: self time with loops, and estimate error, are derived values
   models get wrong when asked to compute them from per-loop numbers.
-- **Best of three** measurements, a 1.1x and 0.5 ms threshold and an unused-index check: a single
-  timing of a small query is noise, and an index the planner ignores is not a fix.
+- **Best of five** measurements with per-node timing off, a noise-aware speedup bar, a 0.5 ms
+  floor, a confirmation re-run for narrow passes and an unused-index check: a single timing of a
+  small query is noise, `EXPLAIN ANALYZE` instrumentation inflates scans, and an index the planner
+  ignores is not a fix. Rewrites and settings alternate between the two arms; index and statistics
+  proofs cannot (the index is either there or not), which is why they lean on the noise estimate.
 - **Parallel plans**: `self_ms` divides a node's combined worker time by the number of
   participating processes (`Workers Launched` + 1), so the digest points at the real bottleneck
   instead of a node whose per-loop time looks tiny.

@@ -88,7 +88,7 @@ These exist because an external review found real exploits. Each has regression 
    labels never show expanded environment values.
 7. **An unproven change is never reported as proven.** `VerifyResult.improved` requires: no
    error, equivalence not false, the new index (or one of its partition children) actually used
-   (for indexes), and a measured speedup of at least 1.1x **and** 0.5 ms. A rewrite identical to
+   (for indexes), and a measured speedup of at least 0.5 ms **and** `max(1.1, 1 + 3 x noise)`x, confirmed by a second run when under 1.3x. A rewrite identical to
    the original is never a proof. `apply` is only returned for a proven change.
 
 ## Conventions

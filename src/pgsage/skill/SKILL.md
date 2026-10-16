@@ -62,13 +62,13 @@ but `inspect` still runs the query on it.
 3. Diagnose from the evidence (the guide below). If the query is already efficient, say so and stop.
 4. Propose one change and prove it with the matching `verify` command. Use `tables[].name` and
    `tables[].schema` from `inspect` for `--table` and `--schema` (the bare table name, not
-   `tables[].table`). Each proof runs the query six times and each statement is capped at 60 s, so
+   `tables[].table`). Each proof runs the query about ten times and each statement is capped at 60 s, so
    skip `verify` for a query over about ten seconds and tell the user why. An index that already
    exists (or already covers the columns as a prefix) is reported as such with its name, without
    a proof.
 5. Read the result. Exit code 0 means proven and 1 means not proven; both print JSON. Exit 2 is a
    failure with `error:` on stderr (bad input, a name or value that is not allowed, no connection,
-   a database failure). For `improved: false`, `reason` says why (below the 1.1x and 0.5 ms floor,
+   a database failure). For `improved: false`, `reason` says why (below the speedup floor,
    the planner ignored the index, the plan did not change, the results differ). An `error` field
    means the call itself failed (a typo in the query, a missing table or column, a value
    PostgreSQL rejected): fix the input and do not count it as a tested idea. Otherwise
@@ -300,12 +300,22 @@ changes which rows come back), anything that changes the select list, anything u
 
 ## What `improved` means
 
-True only when the change measured at least 1.1x and 0.5 ms faster (best of three runs), an index
-was actually used by the new plan, a statistics proof changed the plan, and a rewrite returned the
-same rows on this database's current data. That is a data check, not a proof for all data, so keep
+True only when the change measured at least 0.5 ms faster and at least 1.1x faster (best of five
+runs; per-node timing off), where the 1.1x rises to `1 + 3 x noise` when the repeated runs
+disagree (`before.noise` and `after.noise` show it), an index was actually used by the new plan, a
+statistics proof changed the plan relative to plain `ANALYZE`, and a rewrite returned the same
+rows on this database's current data. A pass under 1.3x is run again and must pass twice
+(`noisy: true` and a `reason` otherwise). Rewrites and settings are measured alternating; index and
+statistics proofs are measured before then after, so they are the more noise-sensitive. That is a data check, not a proof for all data, so keep
 the safety conditions above (`NOT IN` and `NULL` handling in particular). Timings come from one
-database at one moment: tell the user to re-measure on a production-like copy before relying on a
-speedup.
+database at one moment and one level of load, which pgsage cannot see: on a busy host even a
+no-op can appear to pass, so treat anything under about 1.3x as weak and tell the user to
+re-measure on a quiet, production-like copy before relying on it. A gain under 0.5 ms is never
+proven, however large the ratio; if a query is cheap but runs very often, say so and explain the
+trade-off instead of treating it as unproven. Compare cold production behaviour with care: the
+new index's pages are warm in the proof. A float `sum`, `string_agg` or `array_agg` without
+`ORDER BY` can fail the rewrite comparison even for an identical query, and `TABLESAMPLE` is
+never provable.
 
 ## Precision rules
 

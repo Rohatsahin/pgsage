@@ -39,8 +39,8 @@ you paste a slow query
         └─────────────┴──────── the agent reads the verdict and tries something else ┘
 ```
 
-- 🧪 **Proven, not claimed.** Best of three timed runs before and after. No measured speedup, no
-  recommendation.
+- 🧪 **Measured, not claimed.** Best of five timed runs before and after, with a speedup bar that
+  rises with the timing noise it observes. No measured speedup, no recommendation.
 - 🤖 **Built for agents.** An MCP server and a thin command line that prints JSON, plus a skill
   that teaches the agent how to read a plan and what is safe to propose.
 - 🧠 **No model inside.** pgsage never calls an LLM and needs no API key. Your agent is the model.
@@ -139,7 +139,7 @@ on `orders`."*
 
 The two JSON blocks are from a real run on a 300,000-row table (shortened), and the agent's reply
 is illustrative. `baseline_ms` is one cold run of the query; `before` and `after` are the best of
-three runs, which is why they differ. Timings vary with your machine and data. A change that does
+five runs, which is why they differ. Timings vary with your machine and data. A change that does
 not help comes back with `"improved": false` and a `reason`, and the agent tries something else.
 
 ### Connections
@@ -219,7 +219,7 @@ Every database command takes `-c/--connection NAME` or `--dsn`.
 - **A good fit:** a slow `SELECT` on a PostgreSQL scratch or staging copy, where you want an index,
   a rewrite, extended statistics or a settings change that is measured before anyone recommends it.
 - **Not a fit:** writes (`INSERT`, `UPDATE`, `DELETE`), non-PostgreSQL databases, queries that run
-  longer than about 10 s (each proof runs the query six times under a 60 s limit; use
+  longer than about 10 s (each proof runs the query about ten times under a 60 s limit; use
   `inspect --no-analyze` to diagnose from estimates), or measuring the write cost of an index.
 - **Limits you should know:** only PostgreSQL 17 is tested; a speedup is for one machine, one
   dataset and one moment; a rewrite is compared on the current data, not proven for all data.
@@ -228,10 +228,18 @@ Every database command takes `-c/--connection NAME` or `--dsn`.
 
 | Change | Proven when |
 | --- | --- |
-| index (btree, partial, covering, gin, brin, hash) | the new plan uses it and is at least 1.1x and 0.5 ms faster (partitioned parents work) |
+| index (btree, partial, covering, gin, brin, hash) | the new plan uses it and is faster by the bar below (partitioned parents work) |
 | rewrite | same column names, types and precision, same rows (in order if there is a top-level `ORDER BY`), and faster in interleaved runs; a rewrite identical to the original is not a proof |
-| extended statistics | at least 1.1x and 0.5 ms faster **and** a changed plan, with `ANALYZE` run on both sides; the weakest proof, and often not proven |
-| setting | at least 1.1x and 0.5 ms faster with the value applied to this session only; the plan does not have to change and nothing about results is compared |
+| extended statistics | faster by the bar below **and** a changed plan, compared against two runs of plain `ANALYZE` (a plan that already changes between those two is sampling noise and is refused); the weakest proof, and often not proven |
+| setting | faster by the bar below with the value applied to this session only, measured alternating with the default; the plan does not have to change and nothing about results is compared |
+
+**The bar:** at least 0.5 ms faster and at least 1.1x, where the 1.1x rises to `1 + 3 x noise` when
+the repeated runs disagree with each other. A pass under 1.3x is run a second time and must pass
+again. Per-node timing is switched off during measurement, so the instrumentation does not bend the
+ratio. In testing against a quiet PostgreSQL 17 host, changes that cannot help passed about 1% of
+the time; on a host with its CPUs saturated by other work they passed far more often, so measure on
+a quiet database and treat anything under about 1.3x as weak evidence. Gains under 0.5 ms are never
+proven, however large the ratio. `verify` also reports `planning_ms` next to `execution_ms`.
 
 Rewrites that cannot be compared (volatile functions, `LIMIT` without `ORDER BY`) are never
 proven. A proposal that fails on the database comes back as not proven with the error, so the

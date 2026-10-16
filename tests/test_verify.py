@@ -341,16 +341,17 @@ def test_measure_runs_the_query_several_times_and_keeps_the_fastest(
     timings = iter([9.0, 3.0, 7.0, 1.0, 1.0])
     calls: list[str] = []
 
-    def fake(conn: object, sql: str) -> Any:
+    def fake(conn: object, sql: str, analyze: bool = True, timing: bool = True) -> Any:
+        assert timing is False
         calls.append(sql)
         return plan(next(timings))
 
     monkeypatch.setattr(verify_module, "run_explain", fake)
     best = measure(object(), "SELECT 1")  # pyright: ignore[reportArgumentType]
-    assert MEASURE_RUNS == 3
+    assert MEASURE_RUNS == 5
     assert len(calls) == MEASURE_RUNS
-    assert best.execution_time == 1.0 or best.execution_time == 3.0
-    assert best.execution_time == min(9.0, 3.0, 7.0)
+    assert best.result.execution_time == 1.0
+    assert best.noise == 0.0
 
 
 def test_interleaved_measurement_alternates_between_the_two_queries(
@@ -358,14 +359,14 @@ def test_interleaved_measurement_alternates_between_the_two_queries(
 ) -> None:
     order: list[str] = []
 
-    def fake(conn: object, sql: str) -> Any:
+    def fake(conn: object, sql: str, analyze: bool = True, timing: bool = True) -> Any:
         order.append(sql)
         return plan(5.0 if sql == "A" else 2.0)
 
     monkeypatch.setattr(verify_module, "run_explain", fake)
     first, second = measure_interleaved(object(), "A", "B")  # pyright: ignore[reportArgumentType]
     assert order == ["A", "B"] * MEASURE_RUNS
-    assert (first.execution_time, second.execution_time) == (5.0, 2.0)
+    assert (first.result.execution_time, second.result.execution_time) == (5.0, 2.0)
 
 
 @pytest.mark.parametrize(
@@ -796,7 +797,7 @@ def test_every_unproven_verdict_carries_a_reason() -> None:
     same_plan = result("statistics", slow, barely)
     assert same_plan.reason == "the plan did not change"
     below = result("setting", slow, barely)
-    assert below.reason is not None and "below the 1.1x and 0.5 ms floor" in below.reason
+    assert below.reason is not None and "below the 1.10x and 0.5 ms floor" in below.reason
     differs = result("rewrite", slow, barely, equivalent=False, note="result rows differ")
     assert differs.reason == "result rows differ"
     assert result("rewrite", slow, plan_shape(["Index Scan"], 1.0), equivalent=True).reason is None
@@ -878,3 +879,147 @@ def test_an_ordered_rewrite_is_compared_per_row_so_the_result_never_needs_one_hu
         "SELECT id FROM orders WHERE id < 2000 ORDER BY id, customer_id",
     )
     assert result.error is None and result.equivalent is True
+
+
+def noisy_shape(nodes: list[str], ms: float, noise: float) -> Any:
+    return verify_module.PlanSummary(total_cost=1.0, execution_ms=ms, node_types=nodes, noise=noise)
+
+
+def test_the_speedup_floor_rises_with_measured_noise() -> None:
+    quiet = verify_module.VerifyResult(
+        kind="rewrite",
+        statement="s",
+        before=noisy_shape(["Seq Scan"], 10.0, 0.01),
+        after=noisy_shape(["Seq Scan"], 8.5, 0.01),
+        equivalent=True,
+    )
+    busy = quiet.model_copy(
+        update={
+            "before": noisy_shape(["Seq Scan"], 10.0, 0.4),
+            "after": noisy_shape(["Seq Scan"], 8.5, 0.4),
+        }
+    )
+    assert quiet.required_speedup == 1.1 and quiet.improved
+    assert busy.required_speedup == pytest.approx(2.2) and not busy.improved
+    assert busy.reason is not None and "2.20x" in busy.reason
+
+
+def test_a_large_effect_still_passes_on_a_noisy_host() -> None:
+    result = verify_module.VerifyResult(
+        kind="index",
+        statement="s",
+        before=noisy_shape(["Seq Scan"], 100.0, 0.4),
+        after=verify_module.PlanSummary(
+            total_cost=1.0,
+            execution_ms=5.0,
+            node_types=["Index Scan"],
+            uses_new_index=True,
+            noise=0.4,
+        ),
+    )
+    assert result.improved
+
+
+def test_a_narrow_pass_that_does_not_repeat_is_reported_as_noise() -> None:
+    outcomes = iter([1.18, 1.0])
+
+    def run() -> Any:
+        ratio = next(outcomes)
+        return verify_module.VerifyResult(
+            kind="rewrite",
+            statement="s",
+            before=plan_shape(["Seq Scan"], 10.0 * ratio),
+            after=plan_shape(["Seq Scan"], 10.0),
+            equivalent=True,
+        )
+
+    result = verify_module._confirmed(run)  # pyright: ignore[reportPrivateUsage]
+    assert result.noisy and not result.improved
+    assert result.note is not None and "treat this as noise" in result.note
+    assert result.reason == result.note
+
+
+def test_a_clear_pass_is_not_re_run() -> None:
+    calls = 0
+
+    def run() -> Any:
+        nonlocal calls
+        calls += 1
+        return verify_module.VerifyResult(
+            kind="rewrite",
+            statement="s",
+            before=plan_shape(["Seq Scan"], 50.0),
+            after=plan_shape(["Index Scan"], 5.0),
+            equivalent=True,
+        )
+
+    assert verify_module._confirmed(run).improved  # pyright: ignore[reportPrivateUsage]
+    assert calls == 1
+
+
+def test_measured_runs_leave_per_node_timing_off(pg_dsn: str) -> None:
+    with psycopg.connect(pg_dsn) as conn:
+        result = verify_module.measure(conn, "SELECT count(*) FROM orders").result
+        conn.rollback()
+    assert result.execution_time is not None
+    assert all(node.actual_total_time is None for node in result.nodes())
+
+
+def test_a_proof_reports_planning_time_and_noise(pg_dsn: str) -> None:
+    result = verify_rewrite(pg_dsn, QUERY, QUERY + " AND id > 0")
+    shown = result.as_dict()
+    assert shown["before"]["planning_ms"] is not None
+    assert shown["after"]["noise"] is not None
+
+
+def test_tablesample_is_never_provable() -> None:
+    reason = verify_module.unprovable_reason("SELECT * FROM orders TABLESAMPLE SYSTEM (10)")
+    assert reason is not None and "TABLESAMPLE" in reason
+
+
+def test_a_setting_proof_alternates_between_the_default_and_the_new_value(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    real = verify_module.run_explain
+
+    def spy(conn: Any, sql: str, analyze: bool = True, timing: bool = True) -> Any:
+        row = conn.execute("SHOW work_mem").fetchone()
+        seen.append(row[0])
+        return real(conn, sql, analyze, timing)
+
+    monkeypatch.setattr(verify_module, "run_explain", spy)
+    verify_module.verify_setting(
+        pg_dsn, QUERY, verify_module.SettingSuggestion(settings={"work_mem": "96MB"})
+    )
+    assert seen[:4] == ["4MB", "96MB", "4MB", "96MB"]
+
+
+def test_statistics_with_an_unstable_control_are_reported_as_sampling_noise(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shapes = iter([["Seq Scan"], ["Index Scan"], ["Index Scan"]] * 2)
+
+    def fake(conn: Any, sql: str, runs: int = 5) -> Any:
+        return verify_module.Measurement(
+            parse_explain(
+                [
+                    {
+                        "Plan": {
+                            "Node Type": next(shapes)[0],
+                            "Total Cost": 1,
+                            "Plan Rows": 1,
+                        },
+                        "Execution Time": 10.0,
+                    }
+                ]
+            ),
+            0.0,
+        )
+
+    monkeypatch.setattr(verify_module, "measure", fake)
+    result = verify_module.verify_statistics(
+        pg_dsn, QUERY, StatsSuggestion(table="orders", columns=["customer_id", "id"])
+    )
+    assert result.noisy and not result.improved
+    assert result.note is not None and "sampling noise" in result.note

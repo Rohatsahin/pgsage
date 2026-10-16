@@ -66,7 +66,7 @@ pgsage verify statistics --table addresses --columns city,zip --kinds dependenci
 - **Exit codes:** `0` it ran (and, for `verify`, the change is proven); `1` `verify` ran but the
   change is not proven (the JSON still explains why); `2` bad input, bad config, or a database
   error (`error: ...` on stderr).
-- **What `improved` means:** the change measured at least 1.1x and 0.5 ms faster (best of three),
+- **What `improved` means:** the change measured at least 1.1x and 0.5 ms faster (best of five, with a bar that rises with timing noise),
   an index was actually used by the new plan, a statistics proof changed the plan, and a rewrite
   returned the same rows on the current data (a data check, not a proof for all data). A rewrite
   with volatile functions or `LIMIT` without `ORDER BY` is never provable.

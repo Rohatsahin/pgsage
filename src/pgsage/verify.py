@@ -4,6 +4,7 @@ import hashlib
 import re
 import uuid
 from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from typing import Any, Literal, LiteralString, Self, cast
 
 import psycopg
@@ -55,7 +56,11 @@ PARTITIONED_NOTE = (
 DATA_ERROR_CLASSES = ("22", "42", "54")
 MIN_SPEEDUP = 1.1
 MIN_ABSOLUTE_GAIN_MS = 0.5
-MEASURE_RUNS = 3
+MEASURE_RUNS = 5
+NOISE_FACTOR = 3.0
+CONFIRM_BELOW = 1.3
+MAX_NOISE = 0.5
+TABLESAMPLE = re.compile(r"\btablesample\b", re.IGNORECASE)
 STATEMENT_TIMEOUT = "60s"
 LOCK_TIMEOUT = "5s"
 
@@ -307,6 +312,8 @@ class PlanSummary(BaseModel):
     execution_ms: float | None
     node_types: list[str]
     uses_new_index: bool = False
+    planning_ms: float | None = None
+    noise: float | None = None
 
 
 class VerifyResult(BaseModel):
@@ -318,6 +325,7 @@ class VerifyResult(BaseModel):
     note: str | None = None
     error: str | None = None
     apply: list[str] = []
+    noisy: bool = False
 
     @classmethod
     def failed(cls, kind: ChangeKind, statement: str, error: str) -> Self:
@@ -335,9 +343,16 @@ class VerifyResult(BaseModel):
         return self.before.execution_ms / self.after.execution_ms
 
     @property
+    def required_speedup(self) -> float:
+        noise = max(self.before.noise or 0.0, self.after.noise or 0.0)
+        return max(MIN_SPEEDUP, 1.0 + NOISE_FACTOR * noise)
+
+    @property
     def reason(self) -> str | None:
         if self.improved or self.error is not None:
             return None
+        if self.noisy:
+            return self.note
         if self.equivalent is False:
             return self.note or "the results differ"
         if self.kind == "index" and not self.after.uses_new_index:
@@ -348,8 +363,8 @@ class VerifyResult(BaseModel):
         if speedup is not None and self.before.execution_ms and self.after.execution_ms:
             gain = self.before.execution_ms - self.after.execution_ms
             return (
-                f"{speedup:.2f}x and {gain:.2f} ms is below the {MIN_SPEEDUP}x and "
-                f"{MIN_ABSOLUTE_GAIN_MS} ms floor"
+                f"{speedup:.2f}x and {gain:.2f} ms is below the {self.required_speedup:.2f}x and "
+                f"{MIN_ABSOLUTE_GAIN_MS} ms floor (the floor rises with timing noise)"
             )
         return "the plan cost did not drop"
 
@@ -365,7 +380,7 @@ class VerifyResult(BaseModel):
 
     @property
     def improved(self) -> bool:
-        if self.error is not None or self.equivalent is False:
+        if self.error is not None or self.equivalent is False or self.noisy:
             return False
         if self.kind == "index" and not self.after.uses_new_index:
             return False
@@ -374,7 +389,7 @@ class VerifyResult(BaseModel):
         speedup = self.speedup
         if speedup is not None and self.before.execution_ms and self.after.execution_ms:
             gain = self.before.execution_ms - self.after.execution_ms
-            return speedup >= MIN_SPEEDUP and gain >= MIN_ABSOLUTE_GAIN_MS
+            return speedup >= self.required_speedup and gain >= MIN_ABSOLUTE_GAIN_MS
         return self.after.total_cost < self.before.total_cost
 
 
@@ -427,9 +442,16 @@ def run_single(conn: psycopg.Connection[Any], query: SQL | Composed) -> psycopg.
     return conn.execute(query, prepare=True)
 
 
-def run_explain(conn: psycopg.Connection[Any], sql: str, analyze: bool = True) -> ExplainResult:
+def run_explain(
+    conn: psycopg.Connection[Any], sql: str, analyze: bool = True, timing: bool = True
+) -> ExplainResult:
     begin_guarded(conn)
-    options = "ANALYZE, BUFFERS, VERBOSE, FORMAT JSON" if analyze else "VERBOSE, FORMAT JSON"
+    if not analyze:
+        options = "VERBOSE, FORMAT JSON"
+    elif timing:
+        options = "ANALYZE, BUFFERS, VERBOSE, FORMAT JSON"
+    else:
+        options = "ANALYZE, TIMING OFF, BUFFERS, VERBOSE, FORMAT JSON"
     statement = SQL("EXPLAIN ({}) {}").format(SQL(options), literal(sql))
     row = run_single(conn, statement).fetchone()
     if row is None:
@@ -437,9 +459,26 @@ def run_explain(conn: psycopg.Connection[Any], sql: str, analyze: bool = True) -
     return parse_explain(row[0])
 
 
-def measure(conn: psycopg.Connection[Any], sql: str, runs: int = MEASURE_RUNS) -> ExplainResult:
-    results = [run_explain(conn, sql) for _ in range(runs)]
-    return min(results, key=lambda r: r.execution_time if r.execution_time is not None else 0.0)
+@dataclass
+class Measurement:
+    result: ExplainResult
+    noise: float
+
+
+def _execution(result: ExplainResult) -> float:
+    return result.execution_time if result.execution_time is not None else 0.0
+
+
+def fastest(results: list[ExplainResult]) -> Measurement:
+    ordered = sorted(results, key=_execution)
+    best = _execution(ordered[0])
+    runner_up = _execution(ordered[1]) if len(ordered) > 1 else best
+    noise = (runner_up - best) / best if best > 0 else 0.0
+    return Measurement(ordered[0], noise)
+
+
+def measure(conn: psycopg.Connection[Any], sql: str, runs: int = MEASURE_RUNS) -> Measurement:
+    return fastest([run_explain(conn, sql, timing=False) for _ in range(runs)])
 
 
 def begin_guarded(conn: psycopg.Connection[Any]) -> None:
@@ -453,20 +492,17 @@ def _lock_read_only(conn: psycopg.Connection[Any]) -> None:
 
 def measure_interleaved(
     conn: psycopg.Connection[Any], first: str, second: str, runs: int = MEASURE_RUNS
-) -> tuple[ExplainResult, ExplainResult]:
+) -> tuple[Measurement, Measurement]:
     firsts: list[ExplainResult] = []
     seconds: list[ExplainResult] = []
     for _ in range(runs):
-        firsts.append(run_explain(conn, first))
-        seconds.append(run_explain(conn, second))
-
-    def fastest(results: list[ExplainResult]) -> ExplainResult:
-        return min(results, key=lambda r: r.execution_time if r.execution_time is not None else 0.0)
-
+        firsts.append(run_explain(conn, first, timing=False))
+        seconds.append(run_explain(conn, second, timing=False))
     return fastest(firsts), fastest(seconds)
 
 
-def _summarize(result: ExplainResult, new_index_names: Collection[str] = ()) -> PlanSummary:
+def _summarize(measurement: Measurement, new_index_names: Collection[str] = ()) -> PlanSummary:
+    result = measurement.result
     nodes = result.nodes()
     names = set(new_index_names)
     return PlanSummary(
@@ -474,6 +510,8 @@ def _summarize(result: ExplainResult, new_index_names: Collection[str] = ()) -> 
         execution_ms=result.execution_time,
         node_types=[node.node_type for node in nodes],
         uses_new_index=bool(names) and any(node.index_name in names for node in nodes),
+        planning_ms=result.planning_time,
+        noise=round(measurement.noise, 3),
     )
 
 
@@ -503,6 +541,8 @@ def unprovable_reason(sql: str) -> str | None:
     top = top_level(core)
     if VOLATILE_FUNCTIONS.search(mask_keeping_names(sql)):
         return "the query calls a volatile function, so its results cannot be compared"
+    if TABLESAMPLE.search(core):
+        return "TABLESAMPLE returns a random sample, so its results cannot be compared"
     if ROW_LIMIT.search(top) and not ORDER_BY.search(top):
         return "LIMIT/OFFSET/FETCH without a top-level ORDER BY returns an arbitrary subset"
     if ROW_LIMIT.search(core) and not ORDER_BY.search(core):
@@ -680,45 +720,124 @@ def verify_index(dsn: str, sql: str, suggestion: IndexSuggestion) -> VerifyResul
             update["note"] = PARTITIONED_NOTE
         return result.model_copy(update=update)
 
-    return _failed_on_data_error("index", suggestion.ddl, run)
+    return _failed_on_data_error("index", suggestion.ddl, lambda: _confirmed(run))
+
+
+def _confirmed(run: Callable[[], VerifyResult]) -> VerifyResult:
+    first = run()
+    speedup = first.speedup
+    if not first.improved or speedup is None or speedup >= CONFIRM_BELOW:
+        return first
+    second = run()
+    if second.improved:
+        return first
+    return second.model_copy(
+        update={
+            "noisy": True,
+            "note": (
+                f"the first run passed narrowly ({speedup:.2f}x) but a second run did not: "
+                "treat this as noise"
+            ),
+        }
+    )
 
 
 def verify_setting(dsn: str, sql: str, suggestion: SettingSuggestion) -> VerifyResult:
-    def change(conn: psycopg.Connection[Any]) -> None:
-        for name, value in suggestion.settings.items():
-            conn.execute("SELECT set_config(%s, %s, true)", (name, value))
+    ensure_runnable(sql)
 
     def run() -> VerifyResult:
-        result = _experiment(dsn, sql, "setting", suggestion.statement, change)
-        return result.model_copy(
-            update={"apply": suggestion.apply_sql, "note": result.note or SETTING_NOTE}
+        with connect(dsn) as conn:
+            try:
+                begin_guarded(conn)
+                _lock_read_only(conn)
+                originals: dict[str, str] = {}
+                for name in suggestion.settings:
+                    row = conn.execute("SELECT current_setting(%s)", (name,)).fetchone()
+                    originals[name] = str(row[0]) if row else ""
+
+                def apply(values: dict[str, str]) -> None:
+                    for name, value in values.items():
+                        conn.execute("SELECT set_config(%s, %s, true)", (name, value))
+
+                baseline: list[ExplainResult] = []
+                treated: list[ExplainResult] = []
+                for _ in range(MEASURE_RUNS):
+                    apply(originals)
+                    baseline.append(run_explain(conn, sql, timing=False))
+                    apply(suggestion.settings)
+                    treated.append(run_explain(conn, sql, timing=False))
+            finally:
+                conn.rollback()
+        before, after = _summarize(fastest(baseline)), _summarize(fastest(treated))
+        note = SETTING_NOTE
+        if before.node_types == after.node_types:
+            note = f"the plan did not change; {SETTING_NOTE}"
+        return VerifyResult(
+            kind="setting",
+            statement=suggestion.statement,
+            before=before,
+            after=after,
+            apply=suggestion.apply_sql,
+            note=note,
         )
 
-    return _failed_on_data_error("setting", suggestion.statement, run)
+    return _failed_on_data_error("setting", suggestion.statement, lambda: _confirmed(run))
 
 
 def verify_statistics(dsn: str, sql: str, suggestion: StatsSuggestion) -> VerifyResult:
+    ensure_runnable(sql)
     analyze = SQL("ANALYZE {}").format(literal(suggestion.qualified_table))
 
-    def before_setup(conn: psycopg.Connection[Any]) -> None:
+    def control(conn: psycopg.Connection[Any]) -> None:
         run_single(conn, analyze)
 
-    def change(conn: psycopg.Connection[Any]) -> None:
+    def treated(conn: psycopg.Connection[Any]) -> None:
         run_single(conn, literal(suggestion.create_ddl(_unique("pgsage_verify_stats"))))
         run_single(conn, analyze)
 
     def run() -> VerifyResult:
-        result = _experiment(dsn, sql, "statistics", suggestion.ddl, change, before_setup)
-        return result.model_copy(update={"apply": statistics_apply_sql(suggestion)})
+        arms: list[Measurement] = []
+        with connect(dsn) as conn:
+            try:
+                for setup in (control, control, treated):
+                    begin_guarded(conn)
+                    setup(conn)
+                    _lock_read_only(conn)
+                    arms.append(measure(conn, sql))
+                    conn.rollback()
+            finally:
+                conn.rollback()
+        first, second, third = arms
+        stable = _summarize(first).node_types == _summarize(second).node_types
+        result = VerifyResult(
+            kind="statistics",
+            statement=suggestion.ddl,
+            before=_summarize(first),
+            after=_summarize(third),
+            apply=statistics_apply_sql(suggestion),
+        )
+        if stable:
+            return result
+        return result.model_copy(
+            update={
+                "noisy": True,
+                "note": (
+                    "the plan changes between two runs of plain ANALYZE (sampling noise), so a "
+                    "changed plan is not evidence for the statistics object"
+                ),
+            }
+        )
 
-    return _failed_on_data_error("statistics", suggestion.ddl, run)
+    return _failed_on_data_error("statistics", suggestion.ddl, lambda: _confirmed(run))
 
 
 def verify_rewrite(dsn: str, sql: str, rewritten: str) -> VerifyResult:
     ensure_runnable(sql)
     ensure_runnable(rewritten)
     return _failed_on_data_error(
-        "rewrite", _strip(rewritten), lambda: _prove_rewrite(dsn, sql, rewritten)
+        "rewrite",
+        _strip(rewritten),
+        lambda: _confirmed(lambda: _prove_rewrite(dsn, sql, rewritten)),
     )
 
 
