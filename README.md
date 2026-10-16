@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" width="128" height="128" alt="pgsage logo: a query plan tree with one proven branch">
+  <img src="https://raw.githubusercontent.com/Rohatsahin/pgsage/main/assets/logo.svg" width="128" height="128" alt="pgsage logo: a query plan tree with one proven branch">
 </p>
 
 <h1 align="center">pgsage</h1>
@@ -90,7 +90,7 @@ do the same work: `get_top_queries`, `get_query_plan`, `summarize_plan`, `get_ta
 `verify_index_suggestion`, `verify_statistics_suggestion`, `verify_setting_suggestion` and
 `verify_query_rewrite`. The database
 is fixed in the server's environment; no tool accepts a connection string. Details:
-[docs/agents.md](docs/agents.md) and [docs/mcp.md](docs/mcp.md).
+[docs/agents.md](https://github.com/Rohatsahin/pgsage/blob/main/docs/agents.md) and [docs/mcp.md](https://github.com/Rohatsahin/pgsage/blob/main/docs/mcp.md).
 
 ### What the agent sees
 
@@ -251,25 +251,25 @@ must run outside a transaction block).
 
 The real boundary is the database role: **use a dedicated role on a scratch copy of the data.**
 `CREATE INDEX` needs table ownership, so the role must own the tables it proves against (not an
-application or superuser role; see [docs/security.md](docs/security.md)).
+application or superuser role; see [docs/security.md](https://github.com/Rohatsahin/pgsage/blob/main/docs/security.md)).
 On top of that, pgsage accepts one read-only statement, runs every measurement in a read-only
 transaction with timeouts, quotes all identifiers, has PostgreSQL itself refuse any second
 statement, and never takes a connection string from a tool call. Your agent sees what the tools
 return: names, plan conditions, literals and error text from your database. What pgsage does and
-does not protect against: [docs/security.md](docs/security.md).
+does not protect against: [docs/security.md](https://github.com/Rohatsahin/pgsage/blob/main/docs/security.md).
 
 ## Documentation
 
 | | |
 | --- | --- |
-| [docs/agents.md](docs/agents.md) | using pgsage from an AI agent: MCP or shell, the loop, the JSON contract, exit codes |
-| [docs/mcp.md](docs/mcp.md) | MCP setup and tools |
-| [docs/architecture.md](docs/architecture.md) | data flow, the proof, modules |
-| [docs/security.md](docs/security.md) | threat model, residual risks, role setup |
-| [src/pgsage/skill/SKILL.md](src/pgsage/skill/SKILL.md) | the skill: how an agent reads a plan and what it may propose |
-| [SECURITY.md](SECURITY.md) | how to report a vulnerability, and what counts |
-| [AGENTS.md](AGENTS.md) | conventions and hard invariants for AI coding agents and contributors |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | how to contribute |
+| [docs/agents.md](https://github.com/Rohatsahin/pgsage/blob/main/docs/agents.md) | using pgsage from an AI agent: MCP or shell, the loop, the JSON contract, exit codes |
+| [docs/mcp.md](https://github.com/Rohatsahin/pgsage/blob/main/docs/mcp.md) | MCP setup and tools |
+| [docs/architecture.md](https://github.com/Rohatsahin/pgsage/blob/main/docs/architecture.md) | data flow, the proof, modules |
+| [docs/security.md](https://github.com/Rohatsahin/pgsage/blob/main/docs/security.md) | threat model, residual risks, role setup |
+| [src/pgsage/skill/SKILL.md](https://github.com/Rohatsahin/pgsage/blob/main/src/pgsage/skill/SKILL.md) | the skill: how an agent reads a plan and what it may propose |
+| [SECURITY.md](https://github.com/Rohatsahin/pgsage/blob/main/SECURITY.md) | how to report a vulnerability, and what counts |
+| [AGENTS.md](https://github.com/Rohatsahin/pgsage/blob/main/AGENTS.md) | conventions and hard invariants for AI coding agents and contributors |
+| [CONTRIBUTING.md](https://github.com/Rohatsahin/pgsage/blob/main/CONTRIBUTING.md) | how to contribute |
 
 ## Development
 

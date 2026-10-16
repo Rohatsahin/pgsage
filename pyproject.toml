@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "PostgreSQL query tuning for AI agents: your agent proposes, Postgres proves"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "rohatsahin", email = "rohatsahin92@gmail.com" }]
 keywords = ["postgresql", "explain", "query-tuning", "agents", "mcp", "performance"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -38,6 +39,11 @@ dev = [
     "ruff>=0.17.0",
     "testcontainers>=4.15.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Rohatsahin/pgsage"
+Repository = "https://github.com/Rohatsahin/pgsage"
+Issues = "https://github.com/Rohatsahin/pgsage/issues"
 
 [project.scripts]
 pgsage = "pgsage.cli:app"

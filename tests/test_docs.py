@@ -144,3 +144,16 @@ def test_skill_is_packaged_in_the_wheel_layout() -> None:
     from importlib.resources import files
 
     assert (files("pgsage") / "skill" / "SKILL.md").is_file()
+
+
+def test_the_readme_uses_absolute_links_that_point_at_real_files() -> None:
+    readme = (ROOT / "README.md").read_text()
+    assert 'src="assets' not in readme
+    blob = "https://github.com/Rohatsahin/pgsage/blob/main/"
+    raw = "https://raw.githubusercontent.com/Rohatsahin/pgsage/main/"
+    for target in LINK.findall(readme):
+        assert target.startswith(("http://", "https://", "mailto:")), target
+        if target.startswith(blob):
+            assert (ROOT / target.removeprefix(blob)).exists(), target
+    for logo in re.findall(r'src="(' + re.escape(raw) + r'[^"]+)"', readme):
+        assert (ROOT / logo.removeprefix(raw)).exists(), logo
