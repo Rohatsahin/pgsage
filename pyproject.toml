@@ -9,10 +9,13 @@ keywords = ["postgresql", "explain", "query-tuning", "agents", "mcp", "performan
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Database",
+    "Topic :: Software Development",
     "Typing :: Typed",
 ]
 readme = "README.md"
@@ -44,6 +47,8 @@ dev = [
 Homepage = "https://github.com/Rohatsahin/pgsage"
 Repository = "https://github.com/Rohatsahin/pgsage"
 Issues = "https://github.com/Rohatsahin/pgsage/issues"
+Changelog = "https://github.com/Rohatsahin/pgsage/blob/main/CHANGELOG.md"
+Security = "https://github.com/Rohatsahin/pgsage/blob/main/SECURITY.md"
 
 [project.scripts]
 pgsage = "pgsage.cli:app"

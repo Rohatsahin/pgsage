@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 
@@ -134,10 +135,20 @@ def test_skill_tells_the_agent_when_a_change_counts_as_proven() -> None:
     assert "1.1x" in body and "0.5 ms" in body
 
 
-def test_skill_has_no_company_references() -> None:
+def test_skill_has_no_local_paths_or_credentials() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    assert not re.search(r"/(Users|home)/\w+", text)
+    assert not re.search(r"ghp_\w{20,}|AKIA[0-9A-Z]{12,}", text)
+
+
+def test_skill_has_none_of_the_maintainers_forbidden_words() -> None:
+    words = [w.strip().lower() for w in os.environ.get("PGSAGE_FORBIDDEN_WORDS", "").split(",")]
+    forbidden = [w for w in words if w]
+    if not forbidden:
+        pytest.skip("PGSAGE_FORBIDDEN_WORDS is not set")
     text = SKILL.read_text(encoding="utf-8").lower()
-    for word in ("tempo", "nexus", "flyway"):
-        assert not re.search(rf"\b{word}\b", text)
+    for word in forbidden:
+        assert not re.search(rf"\b{re.escape(word)}\b", text)
 
 
 def test_skill_is_packaged_in_the_wheel_layout() -> None:

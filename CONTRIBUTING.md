@@ -1,6 +1,7 @@
 # Contributing
 
-Thanks for helping. The short version:
+Thanks for helping. Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md). The
+short version:
 
 1. `make install` then `make check`. Docker must be running (tests that need it skip cleanly
    without it, so `make check` still lints and type-checks).

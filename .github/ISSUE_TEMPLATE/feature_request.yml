@@ -1,0 +1,14 @@
+name: Feature request
+description: Suggest a change or a new kind of proof
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like pgsage to do?

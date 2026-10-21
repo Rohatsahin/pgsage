@@ -9,7 +9,7 @@ the safety boundary seriously. The threat model and what is and is not protected
 Please do not open a public issue for a security problem.
 
 - Use GitHub's private vulnerability reporting on the repository (Security tab, "Report a
-  vulnerability").
+  vulnerability"), or email rohatsahin92@gmail.com.
 - Include the input that triggers it. A failing test is ideal.
 
 ## What counts

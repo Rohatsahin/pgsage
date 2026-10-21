@@ -12,6 +12,7 @@
 <p align="center">
   <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-3776ab">
   <img alt="Tested on PostgreSQL 17" src="https://img.shields.io/badge/tested%20on-postgresql%2017-336791">
+  <a href="https://github.com/Rohatsahin/pgsage/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Rohatsahin/pgsage/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Typed: pyright strict" src="https://img.shields.io/badge/types-pyright%20strict-informational">
   <img alt="MCP server included" src="https://img.shields.io/badge/MCP-server%20included-8a63d2">
@@ -270,6 +271,8 @@ does not protect against: [docs/security.md](https://github.com/Rohatsahin/pgsag
 | [SECURITY.md](https://github.com/Rohatsahin/pgsage/blob/main/SECURITY.md) | how to report a vulnerability, and what counts |
 | [AGENTS.md](https://github.com/Rohatsahin/pgsage/blob/main/AGENTS.md) | conventions and hard invariants for AI coding agents and contributors |
 | [CONTRIBUTING.md](https://github.com/Rohatsahin/pgsage/blob/main/CONTRIBUTING.md) | how to contribute |
+| [CODE_OF_CONDUCT.md](https://github.com/Rohatsahin/pgsage/blob/main/CODE_OF_CONDUCT.md) | the Contributor Covenant, and where to report a concern |
+| [CHANGELOG.md](https://github.com/Rohatsahin/pgsage/blob/main/CHANGELOG.md) | what changed in each release |
 
 ## Development
 
@@ -284,4 +287,6 @@ and the slowest tests.
 
 ## License
 
-MIT
+[MIT](https://github.com/Rohatsahin/pgsage/blob/main/LICENSE). PostgreSQL is a trademark of the
+PostgreSQL Community Association of Canada; pgsage is an independent project and is not affiliated
+with or endorsed by it.
